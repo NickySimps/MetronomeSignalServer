@@ -3,6 +3,9 @@ const WebSocket = require('ws');
 // Use PORT environment variable from Render, fallback to 10000 for local development
 const PORT = process.env.PORT || 10000;
 
+console.log('Environment PORT:', process.env.PORT);
+console.log('Using PORT:', PORT);
+
 const wss = new WebSocket.Server({ port: PORT });
 const rooms = {};
 
