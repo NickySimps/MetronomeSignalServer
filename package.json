@@ -1,0 +1,12 @@
+{
+  "name": "metronominal-signaling-server",
+  "version": "1.0.0",
+  "description": "A simple WebRTC signaling server for Metronominal.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.11.0"
+  }
+}
