@@ -1,9 +1,6 @@
 const WebSocket = require('ws');
 
-// Create a WebSocket server on port 10000
 const wss = new WebSocket.Server({ port: 10000 });
-
-// A map to store the rooms and the clients in them
 const rooms = {};
 
 console.log('Signaling server is running on port 10000');
@@ -20,28 +17,37 @@ wss.on('connection', ws => {
       return;
     }
 
+    const room = data.room || ws.room;
+    if (!room) {
+        console.error('No room specified');
+        return;
+    }
+
     switch (data.type) {
-      // When a user tries to join a room
       case 'join':
         {
-          const room = data.room;
+          ws.room = room;
           if (!rooms[room]) {
             rooms[room] = [];
           }
           rooms[room].push(ws);
-          ws.room = room;
           console.log(`Client joined room ${room}`);
+
+          // If two clients are in the room, notify the first client
+          if (rooms[room].length === 2) {
+            const otherClient = rooms[room][0];
+            if (otherClient.readyState === WebSocket.OPEN) {
+              otherClient.send(JSON.stringify({ type: 'peer-joined' }));
+            }
+          }
         }
         break;
 
-      // When a user sends an offer, answer, or ICE candidate
       case 'offer':
       case 'answer':
       case 'candidate':
         {
-          const room = ws.room;
-          if (room && rooms[room]) {
-            // Forward the message to the other client in the room
+          if (rooms[room]) {
             rooms[room].forEach(client => {
               if (client !== ws && client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify(data));
@@ -55,7 +61,6 @@ wss.on('connection', ws => {
 
   ws.on('close', () => {
     console.log('Client disconnected');
-    // Remove the client from the room
     const room = ws.room;
     if (room && rooms[room]) {
       rooms[room] = rooms[room].filter(client => client !== ws);
