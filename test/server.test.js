@@ -38,9 +38,9 @@ function roomIdentity(label) {
   return { room: `${label}_${proof}`, credential };
 }
 
-function hostJoin(label) {
+function hostJoin(label, capabilities = ['song-v1']) {
   const identity = roomIdentity(label);
-  return { type: 'join', room: identity.room, requestedRole: 'host', hostCredential: identity.credential, capabilities: ['song-v1'] };
+  return { type: 'join', room: identity.room, requestedRole: 'host', hostCredential: identity.credential, capabilities };
 }
 
 async function startServer(overrides = {}) {
@@ -497,6 +497,59 @@ test('song mode requires an explicitly compatible browser for every room member'
   await modernInbox.next(message => message.type === 'joined');
   const replay = await modernInbox.next(message => message.type === 'state');
   assert.equal(replay.payload.song.name, 'Capability-safe song');
+});
+
+test('song v2 accepts bounded section repeats and track snapshots and rejects legacy peers', async t => {
+  const server = await startServer();
+  t.after(() => server.close());
+  const host = await connect(server.url);
+  const hostInbox = inbox(host);
+  const legacy = await connect(server.url);
+  const legacyInbox = inbox(legacy);
+  t.after(() => Promise.all([closeSocket(host), closeSocket(legacy)]));
+
+  send(host, hostJoin('song-v2-room', ['song-v1', 'song-v2']));
+  await hostInbox.next(message => message.type === 'joined');
+  const snapshotTrack = {
+    name: 'Section Guitar',
+    barSettings: [{ beats: 7, subdivision: 2, rests: [3] }],
+    muted: false,
+    solo: false,
+    volume: 0.8,
+    mainBeatSound: { sound: 'Synth Kick', settings: {} },
+    subdivisionSound: { sound: 'Synth HiHat', settings: {} }
+  };
+  const song = {
+    version: 2,
+    enabled: true,
+    name: 'Snapshot Song',
+    sections: [{ name: 'Verse', startBar: 0, tempo: 140, repeats: 2, tracks: [snapshotTrack] }]
+  };
+  send(host, { type: 'state', payload: validState({ song }) });
+  send(host, { type: 'state-request' });
+  const accepted = await hostInbox.next(message => message.type === 'state' || message.type === 'error');
+  assert.equal(accepted.type, 'state', JSON.stringify(accepted));
+  assert.equal(accepted.payload.song.sections[0].repeats, 2);
+  assert.equal(accepted.payload.song.sections[0].tracks[0].name, 'Section Guitar');
+
+  send(legacy, {
+    type: 'join', room: roomIdentity('song-v2-room').room, requestedRole: 'client', capabilities: ['song-v1']
+  });
+  assert.equal((await legacyInbox.next(message => message.type === 'error')).code, 'incompatible-client');
+
+  send(host, {
+    type: 'state',
+    payload: validState({ song: { ...song, sections: [{ ...song.sections[0], repeats: 17 }] } })
+  });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
+
+  send(host, {
+    type: 'state',
+    payload: validState({
+      song: { ...song, sections: [{ ...song.sections[0], tracks: [{ ...snapshotTrack, recordings: ['private'] }] }] }
+    })
+  });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
 });
 
 test('malformed state and transport messages are rejected before storage', async t => {

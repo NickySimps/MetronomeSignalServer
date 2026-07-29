@@ -18,7 +18,7 @@ function isBoundedInteger(value, min, max) {
 }
 
 function validateJsonShape(value, depth = 0) {
-  if (depth > 8) return false;
+  if (depth > 12) return false;
   if (value === null || typeof value === 'boolean') return true;
   if (typeof value === 'number') return Number.isFinite(value);
   if (typeof value === 'string') return value.length <= 512;
@@ -29,6 +29,37 @@ function validateJsonShape(value, depth = 0) {
   const keys = Object.keys(value);
   return keys.length <= 64
     && keys.every(key => key.length <= 64 && validateJsonShape(value[key], depth + 1));
+}
+
+function hasOnlyKeys(value, allowedKeys) {
+  return Object.keys(value).every(key => allowedKeys.has(key));
+}
+
+function validateSnapshotSound(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && hasOnlyKeys(value, new Set(['sound', 'settings']))
+    && typeof value.sound === 'string' && value.sound.length >= 1 && value.sound.length <= 64
+    && !/^Recording:/i.test(value.sound)
+    && value.settings && typeof value.settings === 'object' && !Array.isArray(value.settings)
+    && validateJsonShape(value.settings);
+}
+
+function validateSnapshotTrack(track) {
+  if (!track || typeof track !== 'object' || Array.isArray(track)
+    || !hasOnlyKeys(track, new Set([
+      'name', 'barSettings', 'muted', 'solo', 'volume', 'mainBeatSound', 'subdivisionSound'
+    ]))
+    || (track.name !== undefined && (typeof track.name !== 'string' || track.name.length < 1 || track.name.length > 64))
+    || !Array.isArray(track.barSettings) || track.barSettings.length < 1 || track.barSettings.length > 64
+    || typeof track.muted !== 'boolean' || typeof track.solo !== 'boolean'
+    || !isFiniteNumber(track.volume) || track.volume < 0 || track.volume > 1
+    || !validateSnapshotSound(track.mainBeatSound) || !validateSnapshotSound(track.subdivisionSound)) return false;
+  return track.barSettings.every(bar => bar && typeof bar === 'object' && !Array.isArray(bar)
+    && hasOnlyKeys(bar, new Set(['beats', 'subdivision', 'rests']))
+    && isBoundedInteger(bar.beats, 1, 64)
+    && isFiniteNumber(bar.subdivision) && bar.subdivision >= 0.125 && bar.subdivision <= 16
+    && Array.isArray(bar.rests) && bar.rests.length <= 256
+    && bar.rests.every(rest => isBoundedInteger(rest, 0, 1023)));
 }
 
 function parseCapabilities(value) {
@@ -53,7 +84,7 @@ function validateState(payload) {
   if (payload.song !== undefined) {
     const song = payload.song;
     if (!song || typeof song !== 'object' || Array.isArray(song)
-      || song.version !== 1
+      || ![1, 2].includes(song.version)
       || typeof song.enabled !== 'boolean'
       || typeof song.name !== 'string' || song.name.length > 80
       || !Array.isArray(song.sections) || song.sections.length < 1 || song.sections.length > 32) return false;
@@ -64,6 +95,13 @@ function validateState(payload) {
         || !isBoundedInteger(section.startBar, 0, 63)
         || section.startBar <= previousStartBar
         || !isBoundedInteger(section.tempo, 20, 300)) return false;
+      if (song.version === 1) {
+        if (!hasOnlyKeys(section, new Set(['name', 'startBar', 'tempo']))) return false;
+      } else if (!hasOnlyKeys(section, new Set(['name', 'startBar', 'tempo', 'repeats', 'tracks']))
+        || !isBoundedInteger(section.repeats, 1, 16)
+        || (section.tracks !== undefined
+          && (!Array.isArray(section.tracks) || section.tracks.length < 1 || section.tracks.length > 16
+            || !section.tracks.every(validateSnapshotTrack)))) return false;
       previousStartBar = section.startBar;
     }
     if (song.sections[0].startBar !== 0) return false;
@@ -92,6 +130,11 @@ function validateState(payload) {
   if (!Number.isInteger(payload.selectedBarIndexInContainer) || payload.selectedBarIndexInContainer < -1) return false;
   if (selectedTrack && payload.selectedBarIndexInContainer >= selectedTrack.barSettings.length) return false;
   return true;
+}
+
+function requiredSongCapability(payload) {
+  if (!payload?.song?.enabled) return null;
+  return payload.song.version === 2 ? 'song-v2' : 'song-v1';
 }
 
 function tempoForBar(payload, currentBar) {
@@ -316,7 +359,8 @@ function createSyncServer({
         }
 
         let room = rooms.get(roomId);
-        if (room?.state?.payload?.song?.enabled && !capabilities.has('song-v1')) {
+        const roomSongCapability = requiredSongCapability(room?.state?.payload);
+        if (roomSongCapability && !capabilities.has(roomSongCapability)) {
           send(ws, { type: 'error', code: 'incompatible-client', message: 'This room requires song mode support.' });
           return;
         }
@@ -433,8 +477,9 @@ function createSyncServer({
             send(ws, { type: 'error', code: 'invalid-state', message: 'State payload failed validation.' });
             return;
           }
-          if (payload.song?.enabled
-            && [...room.clients].some(client => !client.capabilities?.has('song-v1'))) {
+          const songCapability = requiredSongCapability(payload);
+          if (songCapability
+            && [...room.clients].some(client => !client.capabilities?.has(songCapability))) {
             send(ws, { type: 'error', code: 'incompatible-client', message: 'Every room member must support song mode.' });
             if (room.state) {
               send(ws, {
