@@ -40,7 +40,7 @@ function roomIdentity(label) {
 
 function hostJoin(label) {
   const identity = roomIdentity(label);
-  return { type: 'join', room: identity.room, requestedRole: 'host', hostCredential: identity.credential };
+  return { type: 'join', room: identity.room, requestedRole: 'host', hostCredential: identity.credential, capabilities: ['song-v1'] };
 }
 
 async function startServer(overrides = {}) {
@@ -212,13 +212,19 @@ test('server derives a synchronized count-in from authoritative room state', asy
 
   send(host, hostJoin('count-in-room'));
   await hostInbox.next(message => message.type === 'joined');
-  send(client, { type: 'join', room: roomIdentity('count-in-room').room, requestedRole: 'client' });
+  send(client, { type: 'join', room: roomIdentity('count-in-room').room, requestedRole: 'client', capabilities: ['song-v1'] });
   await clientInbox.next(message => message.type === 'joined');
   send(host, {
     type: 'state',
     payload: validState({
       tempo: 120,
       countInBars: 2,
+      song: {
+        version: 1,
+        enabled: true,
+        name: 'Count-in tempo map',
+        sections: [{ name: 'Intro', startBar: 0, tempo: 300 }]
+      },
       Tracks: [{
         ...validState().Tracks[0],
         barSettings: [{ beats: 3, subdivision: 1, rests: [] }]
@@ -236,9 +242,9 @@ test('server derives a synchronized count-in from authoritative room state', asy
   assert.deepEqual(clientPlay, hostPlay);
   assert.ok(hostPlay.countIn.startsAt >= before + 500);
   assert.equal(hostPlay.countIn.totalBeats, 6);
-  assert.equal(hostPlay.countIn.beatIntervalMs, 500);
+  assert.equal(hostPlay.countIn.beatIntervalMs, 200);
   assert.equal(hostPlay.countIn.accentEvery, 3);
-  assert.equal(hostPlay.effectiveAt - hostPlay.countIn.startsAt, 3000);
+  assert.equal(hostPlay.effectiveAt - hostPlay.countIn.startsAt, 1200);
 
   send(host, {
     type: 'playback-sync-pulse',
@@ -251,7 +257,7 @@ test('server derives a synchronized count-in from authoritative room state', asy
   const lateClient = await connect(server.url);
   const lateInbox = inbox(lateClient);
   t.after(() => closeSocket(lateClient));
-  send(lateClient, { type: 'join', room: roomIdentity('count-in-room').room, requestedRole: 'client' });
+  send(lateClient, { type: 'join', room: roomIdentity('count-in-room').room, requestedRole: 'client', capabilities: ['song-v1'] });
   await lateInbox.next(message => message.type === 'joined');
   const replayedPlay = await lateInbox.next(message => message.type === 'transport' && message.playing);
   assert.deepEqual(replayedPlay.countIn, hostPlay.countIn);
@@ -427,6 +433,72 @@ test('a rejected cross-room host request cannot evict the target room host', asy
   assert.equal((await clientInbox.next(message => message.type === 'state')).payload.tempo, 199);
 });
 
+test('song mode requires an explicitly compatible browser for every room member', async t => {
+  const server = await startServer();
+  t.after(() => server.close());
+  const host = await connect(server.url);
+  const hostInbox = inbox(host);
+  const legacy = await connect(server.url);
+  const legacyInbox = inbox(legacy);
+  const room = roomIdentity('song-capability-room').room;
+  t.after(() => Promise.all([closeSocket(host), closeSocket(legacy)]));
+
+  send(host, hostJoin('song-capability-room'));
+  await hostInbox.next(message => message.type === 'joined');
+  await hostInbox.next(message => message.type === 'presence' && message.clientCount === 0);
+  const stoppedState = validState({
+    song: {
+      version: 1,
+      enabled: false,
+      name: 'Capability-safe song',
+      sections: [{ name: 'Intro', startBar: 0, tempo: 173 }]
+    }
+  });
+  send(host, { type: 'state', payload: stoppedState });
+  send(host, { type: 'state-request' });
+  await hostInbox.next(message => message.type === 'state' && message.payload?.song?.enabled === false);
+  send(legacy, { type: 'join', room, requestedRole: 'client' });
+  await legacyInbox.next(message => message.type === 'joined');
+  await hostInbox.next(message => message.type === 'presence' && message.clientCount === 1);
+
+  const songState = validState({
+    song: {
+      version: 1,
+      enabled: true,
+      name: 'Capability-safe song',
+      sections: [{ name: 'Intro', startBar: 0, tempo: 173 }]
+    }
+  });
+  send(host, { type: 'state', payload: songState });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'incompatible-client');
+  const rollback = await hostInbox.next(message => message.type === 'state');
+  assert.equal(rollback.payload.song.enabled, false);
+  assert.equal(rollback.authoritativeRefresh, true);
+
+  await closeSocket(legacy);
+  await hostInbox.next(message => message.type === 'presence' && message.clientCount === 0);
+  assert.equal(server.rooms.get(room).clients.size, 1);
+  assert.equal([...server.rooms.get(room).clients][0].capabilities?.has('song-v1'), true);
+  send(host, { type: 'state', payload: songState });
+  send(host, { type: 'state-request' });
+  const stored = await hostInbox.next(message => message.type === 'state' && message.payload?.song?.name === 'Capability-safe song');
+  assert.equal(stored.type, 'state');
+
+  const lateLegacy = await connect(server.url);
+  const lateLegacyInbox = inbox(lateLegacy);
+  t.after(() => closeSocket(lateLegacy));
+  send(lateLegacy, { type: 'join', room, requestedRole: 'client' });
+  assert.equal((await lateLegacyInbox.next(message => message.type === 'error')).code, 'incompatible-client');
+
+  const modern = await connect(server.url);
+  const modernInbox = inbox(modern);
+  t.after(() => closeSocket(modern));
+  send(modern, { type: 'join', room, requestedRole: 'client', capabilities: ['song-v1'] });
+  await modernInbox.next(message => message.type === 'joined');
+  const replay = await modernInbox.next(message => message.type === 'state');
+  assert.equal(replay.payload.song.name, 'Capability-safe song');
+});
+
 test('malformed state and transport messages are rejected before storage', async t => {
   const server = await startServer();
   t.after(() => server.close());
@@ -438,7 +510,33 @@ test('malformed state and transport messages are rejected before storage', async
 
   send(host, { type: 'state', payload: validState({ tempo: 0 }) });
   assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
+  send(host, { type: 'state', payload: validState({ tempo: 120.5 }) });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
   send(host, { type: 'state', payload: validState({ countInBars: 9 }) });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
+  send(host, {
+    type: 'state',
+    payload: validState({
+      song: {
+        version: 1,
+        enabled: true,
+        name: 'Unsafe arrangement',
+        sections: [{ name: 'Intro', startBar: 0, tempo: 500 }]
+      }
+    })
+  });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
+  send(host, {
+    type: 'state',
+    payload: validState({
+      song: {
+        version: 1,
+        enabled: true,
+        name: 'Fractional tempo',
+        sections: [{ name: 'Intro', startBar: 0, tempo: 120.5 }]
+      }
+    })
+  });
   assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
   send(host, { type: 'transport-command', playing: true, currentBar: -1, currentBeat: 0 });
   assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-transport');

@@ -31,13 +31,43 @@ function validateJsonShape(value, depth = 0) {
     && keys.every(key => key.length <= 64 && validateJsonShape(value[key], depth + 1));
 }
 
+function parseCapabilities(value) {
+  if (value === undefined) return new Set();
+  if (!Array.isArray(value) || value.length > 16) return null;
+  const capabilities = new Set();
+  for (const capability of value) {
+    if (typeof capability !== 'string' || capability.length < 1 || capability.length > 32) return null;
+    capabilities.add(capability);
+  }
+  return capabilities;
+}
+
 function validateState(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
-  if (!isFiniteNumber(payload.tempo) || payload.tempo < 20 || payload.tempo > 400) return false;
+  if (!isBoundedInteger(payload.tempo, 20, 400)) return false;
   if (!isFiniteNumber(payload.volume) || payload.volume < 0 || payload.volume > 1) return false;
   if (payload.countInBars !== undefined && !isBoundedInteger(payload.countInBars, 0, 8)) return false;
   if (!Array.isArray(payload.Tracks) || payload.Tracks.length < 1 || payload.Tracks.length > 32) return false;
   if (!validateJsonShape(payload)) return false;
+
+  if (payload.song !== undefined) {
+    const song = payload.song;
+    if (!song || typeof song !== 'object' || Array.isArray(song)
+      || song.version !== 1
+      || typeof song.enabled !== 'boolean'
+      || typeof song.name !== 'string' || song.name.length > 80
+      || !Array.isArray(song.sections) || song.sections.length < 1 || song.sections.length > 32) return false;
+    let previousStartBar = -1;
+    for (const section of song.sections) {
+      if (!section || typeof section !== 'object' || Array.isArray(section)
+        || typeof section.name !== 'string' || section.name.length < 1 || section.name.length > 48
+        || !isBoundedInteger(section.startBar, 0, 63)
+        || section.startBar <= previousStartBar
+        || !isBoundedInteger(section.tempo, 20, 300)) return false;
+      previousStartBar = section.startBar;
+    }
+    if (song.sections[0].startBar !== 0) return false;
+  }
 
   for (const track of payload.Tracks) {
     if (!track || typeof track !== 'object' || !Array.isArray(track.barSettings)) return false;
@@ -56,11 +86,22 @@ function validateState(payload) {
     if (!isBoundedInteger(track.currentBeat, 0, Math.max(0, maxBeat))) return false;
   }
 
+  if (payload.song && payload.song.sections.some(section => section.startBar >= payload.Tracks[0].barSettings.length)) return false;
   if (!Number.isInteger(payload.selectedTrackIndex) || payload.selectedTrackIndex < -1 || payload.selectedTrackIndex >= payload.Tracks.length) return false;
   const selectedTrack = payload.selectedTrackIndex >= 0 ? payload.Tracks[payload.selectedTrackIndex] : null;
   if (!Number.isInteger(payload.selectedBarIndexInContainer) || payload.selectedBarIndexInContainer < -1) return false;
   if (selectedTrack && payload.selectedBarIndexInContainer >= selectedTrack.barSettings.length) return false;
   return true;
+}
+
+function tempoForBar(payload, currentBar) {
+  if (!payload?.song?.enabled) return payload.tempo;
+  let activeSection = payload.song.sections[0];
+  for (const section of payload.song.sections) {
+    if (section.startBar > currentBar) break;
+    activeSection = section;
+  }
+  return activeSection.tempo;
 }
 
 function countInForTransport(room, currentBar, startsAt) {
@@ -69,7 +110,7 @@ function countInForTransport(room, currentBar, startsAt) {
   if (!countInBars) return null;
   const track = payload.Tracks[0];
   const bar = track.barSettings[currentBar % track.barSettings.length];
-  const beatIntervalMs = 60000 / payload.tempo;
+  const beatIntervalMs = 60000 / tempoForBar(payload, currentBar);
   const totalBeats = countInBars * bar.beats;
   return {
     startsAt,
@@ -263,6 +304,11 @@ function createSyncServer({
           send(ws, { type: 'error', code: 'invalid-room', message: 'A room ID is required.' });
           return;
         }
+        const capabilities = parseCapabilities(data.capabilities);
+        if (!capabilities) {
+          send(ws, { type: 'error', code: 'invalid-capabilities', message: 'Client capabilities failed validation.' });
+          return;
+        }
 
         if (ws.roomId && ws.roomId !== roomId) {
           send(ws, { type: 'error', code: 'already-joined', message: 'Leave the current room before joining another.' });
@@ -270,6 +316,10 @@ function createSyncServer({
         }
 
         let room = rooms.get(roomId);
+        if (room?.state?.payload?.song?.enabled && !capabilities.has('song-v1')) {
+          send(ws, { type: 'error', code: 'incompatible-client', message: 'This room requires song mode support.' });
+          return;
+        }
         let createdRoom = false;
         let replacedHost = false;
         if (!room) {
@@ -326,6 +376,7 @@ function createSyncServer({
         room.clients.add(ws);
         ws.roomId = roomId;
         ws.isHost = room.host === ws;
+        ws.capabilities = capabilities;
 
         send(ws, {
           type: 'joined', room: roomId, peerId: ws.peerId,
@@ -380,6 +431,17 @@ function createSyncServer({
           const payload = sanitizeState(data.payload);
           if (!payload) {
             send(ws, { type: 'error', code: 'invalid-state', message: 'State payload failed validation.' });
+            return;
+          }
+          if (payload.song?.enabled
+            && [...room.clients].some(client => !client.capabilities?.has('song-v1'))) {
+            send(ws, { type: 'error', code: 'incompatible-client', message: 'Every room member must support song mode.' });
+            if (room.state) {
+              send(ws, {
+                type: 'state', room: room.id, revision: room.state.revision,
+                payload: room.state.payload, authoritativeRefresh: true
+              });
+            }
             return;
           }
           room.revision += 1;
