@@ -269,10 +269,17 @@ test('server derives a synchronized count-in from authoritative room state', asy
     type: 'playback-sync-pulse',
     nextBeatWallTime: Date.now() + 100,
     currentBar: 0,
-    currentBeat: 0
+    currentBeat: 0,
+    repeatIteration: 2
   });
-  await clientInbox.next(message => message.type === 'playback-sync-pulse');
+  const pulse = await clientInbox.next(message => message.type === 'playback-sync-pulse');
+  assert.equal(pulse.repeatIteration, 2);
   assert.equal(room.transport.countIn, undefined);
+  assert.equal(room.transport.repeatIteration, 2);
+
+  send(lateClient, { type: 'playback-sync-request' });
+  const replayedPulse = await lateInbox.next(message => message.type === 'transport' && message.playing);
+  assert.equal(replayedPulse.repeatIteration, 2);
 
   send(host, { type: 'transport-command', playing: false, currentBar: 0, currentBeat: 0 });
   const stop = await hostInbox.next(message => message.type === 'transport' && !message.playing);

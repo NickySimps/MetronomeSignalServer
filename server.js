@@ -511,6 +511,7 @@ function createSyncServer({
             effectiveAt: startsAt + (countIn ? countIn.totalBeats * countIn.beatIntervalMs : 0),
             currentBar: data.currentBar,
             currentBeat: data.currentBeat,
+            repeatIteration: 0,
             revision: room.revision,
             leadTime: transportLead,
             ...(countIn ? { countIn } : {})
@@ -528,7 +529,8 @@ function createSyncServer({
             || pulseTime < currentTime - 5000
             || pulseTime > currentTime + 10000
             || !isBoundedInteger(data.currentBar, 0, 4095)
-            || !isBoundedInteger(data.currentBeat, 0, 4095)) {
+            || !isBoundedInteger(data.currentBeat, 0, 4095)
+            || (data.repeatIteration !== undefined && !isBoundedInteger(data.repeatIteration, 0, 15))) {
             send(ws, { type: 'error', code: 'invalid-sync-pulse', message: 'Playback sync pulse failed validation.' });
             return;
           }
@@ -537,6 +539,7 @@ function createSyncServer({
             effectiveAt: pulseTime,
             currentBar: data.currentBar,
             currentBeat: data.currentBeat,
+            repeatIteration: data.repeatIteration || 0,
             revision: room.transport.revision,
             leadTime: room.transport.leadTime || 0
           };
@@ -545,6 +548,7 @@ function createSyncServer({
             nextBeatWallTime: pulseTime,
             currentBar: data.currentBar,
             currentBeat: data.currentBeat,
+            repeatIteration: data.repeatIteration || 0,
             revision: room.transport.revision
           }, ws);
           break;
