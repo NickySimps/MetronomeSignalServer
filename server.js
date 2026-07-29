@@ -75,7 +75,12 @@ function hasValidHostCredential(roomId, credential) {
 function createSyncServer({
   port = Number(process.env.PORT) || 10000,
   logger = console,
-  transportLeadMs = 750,
+  transportLeadMs = Number.isFinite(Number(process.env.TRANSPORT_LEAD_MS))
+    ? Number(process.env.TRANSPORT_LEAD_MS)
+    : null,
+  minimumTransportLeadMs = 150,
+  fallbackTransportLeadMs = 200,
+  maximumTransportLeadMs = 500,
   maxConnections = 1000,
   maxRooms = 500,
   maxClientsPerRoom = 32
@@ -109,6 +114,26 @@ function createSyncServer({
   };
 
   const clientCount = room => Math.max(0, room.clients.size - 1);
+  const probeLatency = ws => {
+    const probeId = crypto.randomBytes(8).toString('hex');
+    ws.latencyProbes.set(probeId, Date.now());
+    while (ws.latencyProbes.size > 2) ws.latencyProbes.delete(ws.latencyProbes.keys().next().value);
+    ws.ping(probeId);
+  };
+  const transportLeadForRoom = room => {
+    if (Number.isFinite(transportLeadMs)) return Math.max(0, transportLeadMs);
+    const now = Date.now();
+    const reportedRoundTrips = [...room.clients]
+      .filter(client => now - client.roundTripMeasuredAt <= 30000)
+      .map(client => client.roundTripTime)
+      .filter(isFiniteNumber);
+    if (!reportedRoundTrips.length) return fallbackTransportLeadMs;
+    const slowestRoundTrip = Math.max(...reportedRoundTrips);
+    return Math.min(
+      maximumTransportLeadMs,
+      Math.max(minimumTransportLeadMs, Math.ceil((slowestRoundTrip / 2) + 100))
+    );
+  };
   const broadcastPresence = room => broadcast(room, {
     type: 'presence', room: room.id, clientCount: clientCount(room)
   });
@@ -162,11 +187,21 @@ function createSyncServer({
     ws.roomId = null;
     ws.isHost = false;
     ws.isAlive = true;
+    ws.roundTripTime = null;
+    ws.latencyProbes = new Map();
     ws.messageWindowStartedAt = Date.now();
     ws.messageCount = 0;
     ws.stateMessageCount = 0;
 
-    ws.on('pong', () => { ws.isAlive = true; });
+    ws.on('pong', payload => {
+      ws.isAlive = true;
+      const probeId = payload.toString();
+      const sentAt = ws.latencyProbes.get(probeId);
+      if (!isFiniteNumber(sentAt)) return;
+      ws.latencyProbes.delete(probeId);
+      ws.roundTripTime = Math.max(0, Date.now() - sentAt);
+      ws.roundTripMeasuredAt = Date.now();
+    });
 
     ws.on('message', raw => {
       const now = Date.now();
@@ -242,7 +277,9 @@ function createSyncServer({
             legacySignaling: false,
             revision: 0,
             state: null,
-            transport: { playing: false, effectiveAt: Date.now(), currentBar: 0, currentBeat: 0, revision: 0 }
+            transport: {
+              playing: false, effectiveAt: Date.now(), currentBar: 0, currentBeat: 0, revision: 0, leadTime: 0
+            }
           };
           rooms.set(roomId, room);
           createdRoom = true;
@@ -288,6 +325,7 @@ function createSyncServer({
           send(room.host, { type: 'peer-joined', room: roomId, peerId: ws.peerId });
         }
         broadcastPresence(room);
+        probeLatency(ws);
         return;
       }
 
@@ -341,12 +379,14 @@ function createSyncServer({
             return;
           }
           room.revision += 1;
+          const transportLead = transportLeadForRoom(room);
           room.transport = {
             playing: data.playing,
-            effectiveAt: Date.now() + transportLeadMs,
+            effectiveAt: Date.now() + transportLead,
             currentBar: data.currentBar,
             currentBeat: data.currentBeat,
-            revision: room.revision
+            revision: room.revision,
+            leadTime: transportLead
           };
           broadcast(room, { type: 'transport', room: room.id, ...room.transport });
           break;
@@ -369,7 +409,8 @@ function createSyncServer({
             effectiveAt: pulseTime,
             currentBar: data.currentBar,
             currentBeat: data.currentBeat,
-            revision: room.transport.revision
+            revision: room.transport.revision,
+            leadTime: room.transport.leadTime || 0
           };
           broadcast(room, {
             type: 'playback-sync-pulse', room: room.id,
@@ -408,10 +449,10 @@ function createSyncServer({
       if (!ws.isAlive) ws.terminate();
       else {
         ws.isAlive = false;
-        ws.ping();
+        probeLatency(ws);
       }
     }
-  }, 30000);
+  }, 10000);
   heartbeat.unref();
 
   const close = () => new Promise(resolve => {

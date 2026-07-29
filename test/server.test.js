@@ -43,8 +43,8 @@ function hostJoin(label) {
   return { type: 'join', room: identity.room, requestedRole: 'host', hostCredential: identity.credential };
 }
 
-async function startServer() {
-  const server = createSyncServer({ port: 0, logger: silentLogger, transportLeadMs: 500 });
+async function startServer(overrides = {}) {
+  const server = createSyncServer({ port: 0, logger: silentLogger, transportLeadMs: 500, ...overrides });
   await new Promise(resolve => server.wss.once('listening', resolve));
   const { port } = server.wss.address();
   return { ...server, url: `ws://127.0.0.1:${port}` };
@@ -199,6 +199,48 @@ test('server schedules one authoritative Play or Stop timestamp for every peer',
   ]);
   assert.deepEqual(clientStop, hostStop);
   assert.ok(hostStop.revision > hostPlay.revision);
+});
+
+test('adaptive transport lead minimizes Play delay while covering the slowest peer', async t => {
+  const server = await startServer({
+    transportLeadMs: null,
+    minimumTransportLeadMs: 150,
+    fallbackTransportLeadMs: 200,
+    maximumTransportLeadMs: 500
+  });
+  t.after(() => server.close());
+  const host = await connect(server.url);
+  const hostInbox = inbox(host);
+  const client = await connect(server.url);
+  const clientInbox = inbox(client);
+  t.after(() => Promise.all([closeSocket(host), closeSocket(client)]));
+
+  send(host, hostJoin('adaptive-lead'));
+  await hostInbox.next(message => message.type === 'joined');
+  send(client, { type: 'join', room: roomIdentity('adaptive-lead').room, requestedRole: 'client' });
+  await clientInbox.next(message => message.type === 'joined');
+  const room = server.rooms.get(roomIdentity('adaptive-lead').room);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(Number.isFinite(room.host.roundTripTime));
+  assert.ok(Number.isFinite([...room.clients].find(peer => peer !== room.host).roundTripTime));
+  room.host.roundTripTime = 40;
+  room.host.roundTripMeasuredAt = Date.now();
+  const clientPeer = [...room.clients].find(peer => peer !== room.host);
+  clientPeer.roundTripTime = 300;
+  clientPeer.roundTripMeasuredAt = Date.now();
+
+  const before = Date.now();
+  send(host, { type: 'transport-command', playing: true, currentBar: 0, currentBeat: 0 });
+  const play = await hostInbox.next(message => message.type === 'transport' && message.playing);
+  const lead = play.effectiveAt - before;
+  assert.ok(lead >= 200, `expected at least 200ms lead, received ${lead}ms`);
+  assert.ok(lead < 300, `expected adaptive lead below 300ms, received ${lead}ms`);
+
+  room.host.roundTripMeasuredAt = Date.now() - 30001;
+  clientPeer.roundTripMeasuredAt = Date.now() - 30001;
+  send(host, { type: 'transport-command', playing: false, currentBar: 0, currentBeat: 0 });
+  const fallback = await hostInbox.next(message => message.type === 'transport' && !message.playing);
+  assert.equal(fallback.leadTime, 200);
 });
 
 test('host disconnect closes the room instead of silently promoting a client', async t => {
