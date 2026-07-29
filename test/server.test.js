@@ -201,6 +201,78 @@ test('server schedules one authoritative Play or Stop timestamp for every peer',
   assert.ok(hostStop.revision > hostPlay.revision);
 });
 
+test('server derives a synchronized count-in from authoritative room state', async t => {
+  const server = await startServer();
+  t.after(() => server.close());
+  const host = await connect(server.url);
+  const hostInbox = inbox(host);
+  const client = await connect(server.url);
+  const clientInbox = inbox(client);
+  t.after(() => Promise.all([closeSocket(host), closeSocket(client)]));
+
+  send(host, hostJoin('count-in-room'));
+  await hostInbox.next(message => message.type === 'joined');
+  send(client, { type: 'join', room: roomIdentity('count-in-room').room, requestedRole: 'client' });
+  await clientInbox.next(message => message.type === 'joined');
+  send(host, {
+    type: 'state',
+    payload: validState({
+      tempo: 120,
+      countInBars: 2,
+      Tracks: [{
+        ...validState().Tracks[0],
+        barSettings: [{ beats: 3, subdivision: 1, rests: [] }]
+      }]
+    })
+  });
+  await clientInbox.next(message => message.type === 'state');
+
+  const before = Date.now();
+  send(host, { type: 'transport-command', playing: true, currentBar: 0, currentBeat: 0, countInBars: 8 });
+  const [hostPlay, clientPlay] = await Promise.all([
+    hostInbox.next(message => message.type === 'transport' && message.playing),
+    clientInbox.next(message => message.type === 'transport' && message.playing)
+  ]);
+  assert.deepEqual(clientPlay, hostPlay);
+  assert.ok(hostPlay.countIn.startsAt >= before + 500);
+  assert.equal(hostPlay.countIn.totalBeats, 6);
+  assert.equal(hostPlay.countIn.beatIntervalMs, 500);
+  assert.equal(hostPlay.countIn.accentEvery, 3);
+  assert.equal(hostPlay.effectiveAt - hostPlay.countIn.startsAt, 3000);
+
+  send(host, {
+    type: 'playback-sync-pulse',
+    nextBeatWallTime: hostPlay.countIn.startsAt,
+    currentBar: 0,
+    currentBeat: 0
+  });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-sync-pulse');
+
+  const lateClient = await connect(server.url);
+  const lateInbox = inbox(lateClient);
+  t.after(() => closeSocket(lateClient));
+  send(lateClient, { type: 'join', room: roomIdentity('count-in-room').room, requestedRole: 'client' });
+  await lateInbox.next(message => message.type === 'joined');
+  const replayedPlay = await lateInbox.next(message => message.type === 'transport' && message.playing);
+  assert.deepEqual(replayedPlay.countIn, hostPlay.countIn);
+  assert.equal(replayedPlay.effectiveAt, hostPlay.effectiveAt);
+
+  const room = server.rooms.get(roomIdentity('count-in-room').room);
+  room.transport.effectiveAt = Date.now() - 1;
+  send(host, {
+    type: 'playback-sync-pulse',
+    nextBeatWallTime: Date.now() + 100,
+    currentBar: 0,
+    currentBeat: 0
+  });
+  await clientInbox.next(message => message.type === 'playback-sync-pulse');
+  assert.equal(room.transport.countIn, undefined);
+
+  send(host, { type: 'transport-command', playing: false, currentBar: 0, currentBeat: 0 });
+  const stop = await hostInbox.next(message => message.type === 'transport' && !message.playing);
+  assert.equal(stop.countIn, undefined);
+});
+
 test('adaptive transport lead minimizes Play delay while covering the slowest peer', async t => {
   const server = await startServer({
     transportLeadMs: null,
@@ -365,6 +437,8 @@ test('malformed state and transport messages are rejected before storage', async
   await hostInbox.next(message => message.type === 'joined');
 
   send(host, { type: 'state', payload: validState({ tempo: 0 }) });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
+  send(host, { type: 'state', payload: validState({ countInBars: 9 }) });
   assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
   send(host, { type: 'transport-command', playing: true, currentBar: -1, currentBeat: 0 });
   assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-transport');

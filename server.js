@@ -35,6 +35,7 @@ function validateState(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
   if (!isFiniteNumber(payload.tempo) || payload.tempo < 20 || payload.tempo > 400) return false;
   if (!isFiniteNumber(payload.volume) || payload.volume < 0 || payload.volume > 1) return false;
+  if (payload.countInBars !== undefined && !isBoundedInteger(payload.countInBars, 0, 8)) return false;
   if (!Array.isArray(payload.Tracks) || payload.Tracks.length < 1 || payload.Tracks.length > 32) return false;
   if (!validateJsonShape(payload)) return false;
 
@@ -60,6 +61,22 @@ function validateState(payload) {
   if (!Number.isInteger(payload.selectedBarIndexInContainer) || payload.selectedBarIndexInContainer < -1) return false;
   if (selectedTrack && payload.selectedBarIndexInContainer >= selectedTrack.barSettings.length) return false;
   return true;
+}
+
+function countInForTransport(room, currentBar, startsAt) {
+  const payload = room.state?.payload;
+  const countInBars = payload?.countInBars || 0;
+  if (!countInBars) return null;
+  const track = payload.Tracks[0];
+  const bar = track.barSettings[currentBar % track.barSettings.length];
+  const beatIntervalMs = 60000 / payload.tempo;
+  const totalBeats = countInBars * bar.beats;
+  return {
+    startsAt,
+    totalBeats,
+    beatIntervalMs,
+    accentEvery: bar.beats
+  };
 }
 
 function hasValidHostCredential(roomId, credential) {
@@ -380,13 +397,16 @@ function createSyncServer({
           }
           room.revision += 1;
           const transportLead = transportLeadForRoom(room);
+          const startsAt = Date.now() + transportLead;
+          const countIn = data.playing ? countInForTransport(room, data.currentBar, startsAt) : null;
           room.transport = {
             playing: data.playing,
-            effectiveAt: Date.now() + transportLead,
+            effectiveAt: startsAt + (countIn ? countIn.totalBeats * countIn.beatIntervalMs : 0),
             currentBar: data.currentBar,
             currentBeat: data.currentBeat,
             revision: room.revision,
-            leadTime: transportLead
+            leadTime: transportLead,
+            ...(countIn ? { countIn } : {})
           };
           broadcast(room, { type: 'transport', room: room.id, ...room.transport });
           break;
@@ -396,6 +416,7 @@ function createSyncServer({
           const pulseTime = Number(data.nextBeatWallTime);
           const currentTime = Date.now();
           if (!room.transport.playing
+            || (room.transport.countIn && currentTime < room.transport.effectiveAt)
             || !Number.isFinite(pulseTime)
             || pulseTime < currentTime - 5000
             || pulseTime > currentTime + 10000
