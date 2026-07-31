@@ -84,6 +84,7 @@ function validateState(payload) {
   if (payload.song !== undefined) {
     const song = payload.song;
     if (!song || typeof song !== 'object' || Array.isArray(song)
+      || !hasOnlyKeys(song, new Set(['version', 'enabled', 'name', 'sections']))
       || ![1, 2].includes(song.version)
       || typeof song.enabled !== 'boolean'
       || typeof song.name !== 'string' || song.name.length > 80

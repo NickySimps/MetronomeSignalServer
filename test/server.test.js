@@ -557,6 +557,12 @@ test('song v2 accepts bounded section repeats and track snapshots and rejects le
     })
   });
   assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
+
+  send(host, {
+    type: 'state',
+    payload: validState({ song: { ...song, serializedRecordings: { private: 'SECRET' } } })
+  });
+  assert.equal((await hostInbox.next(message => message.type === 'error')).code, 'invalid-state');
 });
 
 test('malformed state and transport messages are rejected before storage', async t => {
