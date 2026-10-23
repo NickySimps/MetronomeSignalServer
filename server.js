@@ -174,6 +174,16 @@ function hasValidHostCredential(roomId, credential) {
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
+function credentialDigest(value) {
+  return typeof value === 'string' && value.length >= 32 && value.length <= 128
+    ? crypto.createHash('sha256').update(value).digest('hex') : null;
+}
+
+function matchesRoomCredential(room, value) {
+  const digest = credentialDigest(value);
+  return Boolean(digest && crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(room.credentialDigest)));
+}
+
 function createSyncServer({
   port = Number(process.env.PORT) || 10000,
   logger = console,
@@ -193,6 +203,21 @@ function createSyncServer({
   });
   const wss = new WebSocket.Server({ server: httpServer, maxPayload: 512 * 1024 });
   const rooms = new Map();
+  // Bounded lifetime tombstones prevent an original room proof reclaiming a
+  // deliberately closed/expired room after a credential rotation.
+  const closedRooms = new Set();
+  let admissionScope = crypto.randomBytes(16).toString('hex');
+  const scopedRoom = /^v2_([a-f0-9]{32})_[A-Za-z0-9_]+_([a-f0-9]{32})$/;
+  // Only the current admission namespace needs tombstones. Older namespaces
+  // remain valid solely for already-retained active/recovering room objects.
+  const retireRoom = room => {
+    if (!room.scoped || room.scope !== admissionScope) return;
+    closedRooms.add(room.id);
+    if (closedRooms.size >= maxRooms) {
+      admissionScope = crypto.randomBytes(16).toString('hex');
+      closedRooms.clear();
+    }
+  };
 
   httpServer.listen(port);
 
@@ -236,9 +261,33 @@ function createSyncServer({
       Math.max(minimumTransportLeadMs, Math.ceil((slowestRoundTrip / 2) + 100))
     );
   };
-  const broadcastPresence = room => broadcast(room, {
-    type: 'presence', room: room.id, clientCount: clientCount(room)
+  const supportsRehearsal = ws => ws?.capabilities?.has('rehearsal-v1');
+  const rehearsalState = room => ({
+    type: 'rehearsal-room', room: room.id, supported: true,
+    hostPeerId: room.host?.peerId || null,
+    hostConnected: Boolean(room.host && room.clients.has(room.host)),
+    playing: room.transport.playing,
+    participants: [...room.clients].map(client => ({
+      peerId: client.peerId, name: client.readiness?.name || `Peer ${client.peerId.slice(0, 6)}`,
+      role: room.host === client ? 'host' : 'client', connected: true,
+      supported: Boolean(supportsRehearsal(client)),
+      ready: supportsRehearsal(client) ? (client.readiness?.ready || false) : null,
+      audioState: client.readiness?.audioState || 'unknown',
+      clockQuality: client.readiness?.clockQuality || 'unknown',
+      rtt: client.readiness?.rtt ?? null,
+      reportedAt: client.readiness?.reportedAt || null
+    })),
+    requests: [...(room.controlRequests || [])].filter(id => [...room.clients].some(c => c.peerId === id)),
+    cue: room.cue || null
   });
+  const broadcastRehearsal = room => {
+    const message = rehearsalState(room);
+    for (const client of room.clients) if (supportsRehearsal(client)) send(client, message);
+  };
+  const broadcastPresence = room => {
+    broadcast(room, { type: 'presence', room: room.id, clientCount: clientCount(room) });
+    broadcastRehearsal(room);
+  };
 
   const sanitizeState = payload => {
     if (!validateState(payload)) return null;
@@ -267,6 +316,8 @@ function createSyncServer({
   };
 
   const closeRoom = (room, reason = 'host-disconnected') => {
+    clearTimeout(room.recoveryTimer);
+    retireRoom(room);
     broadcast(room, { type: 'room-closed', room: room.id, reason }, room.host);
     for (const client of room.clients) {
       client.roomId = null;
@@ -342,8 +393,18 @@ function createSyncServer({
         return;
       }
 
+      if (data.type === 'hello') {
+        if (typeof data.challenge !== 'string' || !/^[a-f0-9]{32}$/.test(data.challenge)) {
+          send(ws, { type: 'error', code: 'invalid-hello', message: 'A valid challenge is required.' });
+          return;
+        }
+        send(ws, { type: 'hello', challenge: data.challenge, roomScope: admissionScope,
+          capabilities: ['room-scope-v2'] });
+        return;
+      }
+
       if (data.type === 'join') {
-        const roomId = String(data.room || '').trim().slice(0, 128);
+        const roomId = typeof data.room === 'string' && data.room.length <= 128 ? data.room : '';
         if (!roomId) {
           send(ws, { type: 'error', code: 'invalid-room', message: 'A room ID is required.' });
           return;
@@ -360,6 +421,18 @@ function createSyncServer({
         }
 
         let room = rooms.get(roomId);
+        const scoped = roomId.startsWith('v2_');
+        const scopeMatch = scoped ? roomId.match(scopedRoom) : null;
+        // This check must precede proof validation and ignores all advertised
+        // capabilities: removing a capability cannot downgrade a v2 identity.
+        if (scoped && (!scopeMatch || (!room && scopeMatch[1] !== admissionScope))) {
+          send(ws, { type: 'error', code: 'room-expired', message: 'This room expired. Ask for a new room link.' });
+          return;
+        }
+        if (closedRooms.has(roomId)) {
+          send(ws, { type: 'error', code: 'room-closed', message: 'This room was closed. Create a new room.' });
+          return;
+        }
         const roomSongCapability = requiredSongCapability(room?.state?.payload);
         if (roomSongCapability && !capabilities.has(roomSongCapability)) {
           send(ws, { type: 'error', code: 'incompatible-client', message: 'This room requires song mode support.' });
@@ -383,9 +456,13 @@ function createSyncServer({
           }
 
           room = {
-            id: roomId,
+            id: roomId, scoped, scope: scopeMatch?.[1] || null,
             clients: new Set(),
             host: ws,
+            credentialDigest: credentialDigest(data.hostCredential),
+            controlRequests: new Set(),
+            participantSessions: new Map(),
+            recoverable: capabilities.has('rehearsal-v1'),
             legacySignaling: false,
             revision: 0,
             state: null,
@@ -396,7 +473,7 @@ function createSyncServer({
           rooms.set(roomId, room);
           createdRoom = true;
         } else if (data.requestedRole === 'host') {
-          if (!hasValidHostCredential(roomId, data.hostCredential)) {
+          if (!matchesRoomCredential(room, data.hostCredential)) {
             send(ws, { type: 'error', code: 'invalid-host-credential', message: 'Host credential is invalid.' });
             return;
           }
@@ -408,6 +485,13 @@ function createSyncServer({
             previousHost.isHost = false;
             room.host = ws;
             replacedHost = true;
+            if (room.recoverable) {
+              room.revision += 1;
+              if (room.state) room.state = { revision: room.revision, payload: { ...room.state.payload, isPlaying: false } };
+              room.transport = { playing: false, effectiveAt: Date.now(), currentBar: room.transport.currentBar,
+                currentBeat: room.transport.currentBeat, repeatIteration: 0, revision: room.revision, leadTime: 0 };
+              broadcast(room, { type: 'transport', room: room.id, ...room.transport });
+            }
             send(previousHost, { type: 'host-replaced', room: roomId });
             setTimeout(() => previousHost.close(4002, 'Host reconnected elsewhere'), 100);
           }
@@ -422,10 +506,35 @@ function createSyncServer({
         ws.roomId = roomId;
         ws.isHost = room.host === ws;
         ws.capabilities = capabilities;
+        let participantCredential;
+        if (supportsRehearsal(ws)) {
+          const digest = credentialDigest(data.participantCredential);
+          const previousId = digest && room.participantSessions.get(digest);
+          if (previousId) {
+            const previous = [...room.clients].find(c => c !== ws && c.peerId === previousId);
+            // A participant session is not a host credential.
+            if (!previous || previous !== room.host) {
+              if (previous) {
+                room.clients.delete(previous);
+                previous.roomId = null;
+                previous.close(4002, 'Participant reconnected elsewhere');
+              }
+              ws.peerId = previousId;
+            }
+          }
+          participantCredential = previousId ? data.participantCredential : crypto.randomBytes(32).toString('hex');
+          room.participantSessions.set(credentialDigest(participantCredential), ws.peerId);
+          while (room.participantSessions.size > (maxClientsPerRoom + 1) * 2) {
+            room.participantSessions.delete(room.participantSessions.keys().next().value);
+          }
+        }
+        if (ws.isHost) clearTimeout(room.recoveryTimer);
 
         send(ws, {
           type: 'joined', room: roomId, peerId: ws.peerId,
-          isHost: ws.isHost, clientCount: clientCount(room), createdRoom, replacedHost
+          isHost: ws.isHost, clientCount: clientCount(room), createdRoom, replacedHost,
+          capabilities: ['rehearsal-v1'],
+          ...(participantCredential ? { participantCredential } : {})
         });
         if ((!ws.isHost || replacedHost) && room.state) {
           send(ws, { type: 'state', room: roomId, revision: room.state.revision, payload: room.state.payload });
@@ -444,8 +553,99 @@ function createSyncServer({
 
       const room = requireJoinedRoom(ws, data);
       if (!room) return;
+      if (data.room !== undefined && data.room !== room.id) {
+        send(ws, { type: 'error', code: 'room-mismatch', message: 'Message belongs to another room.' });
+        return;
+      }
+      if (['readiness', 'control-request', 'handoff-control', 'rehearsal-cue'].includes(data.type)) {
+        if (raw.length > 1024) {
+          send(ws, { type: 'error', code: 'rehearsal-too-large', message: 'Rehearsal message exceeds size limit.' });
+          return;
+        }
+        if (ws.rehearsalWindow !== ws.messageWindowStartedAt) {
+          ws.rehearsalWindow = ws.messageWindowStartedAt; ws.rehearsalMessages = 0;
+        }
+        if (++ws.rehearsalMessages > 40) {
+          send(ws, { type: 'error', code: 'rehearsal-rate-limit', message: 'Rehearsal messages are arriving too quickly.' });
+          return;
+        }
+      }
 
       switch (data.type) {
+        case 'rehearsal-cue': {
+          if (!requireHost(ws, room)) return;
+          if (!supportsRehearsal(ws) || !hasOnlyKeys(data, new Set(['type', 'room', 'text', 'bar']))
+            || typeof data.text !== 'string' || !data.text.trim() || data.text.length > 140
+            || /[<>\x00-\x1f\x7f]/.test(data.text)
+            || !(data.bar === null || isBoundedInteger(data.bar, 0, 4095))) {
+            send(ws, { type: 'error', code: 'invalid-cue', message: 'Cue must contain plain text up to 140 characters and an optional bar.' });
+            return;
+          }
+          room.cue = { text: data.text, bar: data.bar, sequence: (room.cue?.sequence || 0) + 1, sentAt: now };
+          broadcastRehearsal(room);
+          break;
+        }
+        case 'control-request': {
+          if (!room.scoped || !supportsRehearsal(ws) || !supportsRehearsal(room.host) || room.host === ws
+            || !hasOnlyKeys(data, new Set(['type', 'room']))) {
+            send(ws, { type: 'error', code: 'unsupported-capability', message: 'A capable connected host and client are required.' });
+            return;
+          }
+          room.controlRequests.add(ws.peerId);
+          broadcastRehearsal(room);
+          break;
+        }
+        case 'handoff-control': {
+          if (!requireHost(ws, room)) return;
+          if (room.transport.playing || room.transport.effectiveAt > now) {
+            send(ws, { type: 'error', code: 'handoff-playing', message: 'Stop playback before handing off control.' });
+            return;
+          }
+          const target = [...room.clients].find(c => c.peerId === data.peerId && c !== ws && c.readyState === WebSocket.OPEN);
+          if (!room.scoped || !supportsRehearsal(ws) || !target || !supportsRehearsal(target) || !room.controlRequests.has(target.peerId)
+            || !hasOnlyKeys(data, new Set(['type', 'room', 'peerId']))) {
+            send(ws, { type: 'error', code: 'invalid-handoff', message: 'Choose a connected participant who requested control.' });
+            return;
+          }
+          const hostCredential = crypto.randomBytes(32).toString('hex');
+          room.credentialDigest = credentialDigest(hostCredential);
+          room.host = target;
+          room.recoverable = true;
+          ws.isHost = false;
+          target.isHost = true;
+          room.controlRequests.clear();
+          room.revision += 1;
+          room.transport = { ...room.transport, revision: room.revision };
+          send(ws, { type: 'role-changed', room: room.id, isHost: false });
+          send(target, { type: 'host-granted', room: room.id, hostCredential });
+          broadcast(room, { type: 'transport', room: room.id, ...room.transport });
+          broadcastRehearsal(room);
+          break;
+        }
+        case 'readiness': {
+          if (!supportsRehearsal(ws)) {
+            send(ws, { type: 'error', code: 'unsupported-capability', message: 'Rehearsal support is required.' });
+            return;
+          }
+          if (!hasOnlyKeys(data, new Set(['type', 'room', 'ready', 'name', 'audioState', 'clockQuality', 'rtt']))
+            || typeof data.ready !== 'boolean' || typeof data.name !== 'string'
+            || data.name.length < 1 || data.name.length > 40 || /[<>\x00-\x1f\x7f]/.test(data.name)
+            || !['running', 'suspended', 'interrupted', 'closed', 'unavailable'].includes(data.audioState)
+            || !['good', 'fair', 'poor', 'syncing', 'offline'].includes(data.clockQuality)
+            || !(data.rtt === null || (isFiniteNumber(data.rtt) && data.rtt >= 0 && data.rtt <= 60000))) {
+            send(ws, { type: 'error', code: 'invalid-readiness', message: 'Readiness report failed validation.' });
+            return;
+          }
+          if (ws.lastReadinessAt && now - ws.lastReadinessAt < 100) {
+            send(ws, { type: 'error', code: 'rehearsal-rate-limit', message: 'Reports are arriving too quickly.' });
+            return;
+          }
+          ws.lastReadinessAt = now;
+          ws.readiness = { ready: data.ready, name: data.name, audioState: data.audioState,
+            clockQuality: data.clockQuality, rtt: data.rtt, reportedAt: now };
+          broadcastRehearsal(room);
+          break;
+        }
         case 'offer':
         case 'answer':
         case 'candidate': {
@@ -518,6 +718,7 @@ function createSyncServer({
             ...(countIn ? { countIn } : {})
           };
           broadcast(room, { type: 'transport', room: room.id, ...room.transport });
+          broadcastRehearsal(room);
           break;
         }
         case 'playback-sync-pulse': {
@@ -570,7 +771,19 @@ function createSyncServer({
       const room = ws.roomId ? rooms.get(ws.roomId) : null;
       if (!room) return;
       room.clients.delete(ws);
-      if (room.host === ws) closeRoom(room, 'host-disconnected');
+      room.controlRequests.delete(ws.peerId);
+      if (room.host === ws && room.recoverable) {
+        room.revision += 1;
+        if (room.state) room.state = { revision: room.revision, payload: { ...room.state.payload, isPlaying: false } };
+        room.transport = { playing: false, effectiveAt: Date.now(), currentBar: room.transport.currentBar,
+          currentBeat: room.transport.currentBeat, repeatIteration: 0, revision: room.revision, leadTime: 0 };
+        broadcast(room, { type: 'transport', room: room.id, ...room.transport });
+        broadcastPresence(room);
+        room.recoveryTimer = setTimeout(() => {
+          if (rooms.get(room.id) === room && !room.clients.has(room.host)) closeRoom(room, 'recovery-expired');
+        }, 5 * 60 * 1000);
+        room.recoveryTimer.unref();
+      } else if (room.host === ws) closeRoom(room, 'host-disconnected');
       else broadcastPresence(room);
     });
 
@@ -590,6 +803,8 @@ function createSyncServer({
 
   const close = () => new Promise(resolve => {
     clearInterval(heartbeat);
+    for (const room of rooms.values()) clearTimeout(room.recoveryTimer);
+    rooms.clear();
     for (const ws of wss.clients) ws.terminate();
     wss.close(() => httpServer.close(resolve));
   });
