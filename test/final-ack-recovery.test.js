@@ -1,0 +1,25 @@
+const test=require('node:test'),assert=require('node:assert/strict'),crypto=require('crypto'),WebSocket=require('ws');
+const {createSyncServer}=require('../server');
+const state={tempo:120,volume:1,Tracks:[{volume:1,currentBar:0,currentBeat:0,barSettings:[{beats:4,subdivision:1,rests:[]}]}],selectedTrackIndex:0,selectedBarIndexInContainer:0};
+async function fixture(t){const server=createSyncServer({port:0,logger:{log(){},warn(){}}});await new Promise(r=>server.wss.once('listening',r));const sockets=[];t.after(async()=>{for(const s of sockets)s.terminate();await server.close();});const credential=crypto.randomBytes(32).toString('hex'),room='ack_'+crypto.createHash('sha256').update(credential).digest('hex').slice(0,32);async function peer(role){const ws=new WebSocket(`ws://127.0.0.1:${server.wss.address().port}`),messages=[];ws.on('message',raw=>messages.push(JSON.parse(raw)));await new Promise(r=>ws.once('open',r));sockets.push(ws);const p={ws,messages,send:m=>ws.send(JSON.stringify(m)),async next(type){const end=Date.now()+2000;while(Date.now()<end){const i=messages.findIndex(m=>m.type===type);if(i>=0)return messages.splice(i,1)[0];await new Promise(r=>setTimeout(r,5));}throw Error('No '+type+': '+JSON.stringify(messages));}};if(role){p.send({type:'join',room,requestedRole:role,capabilities:['state-v1'],...(role==='host'?{hostCredential:credential}:{})});await p.next('joined');}return p;}const host=await peer('host');host.send({type:'state',room,payload:state});const client=await peer('client'),snapshot=await client.next('state');return{server,room,host,client,peer,snapshot};}
+const acknowledgement=snapshot=>({type:'state-ack',revision:snapshot.revision,checksum:crypto.createHash('sha256').update(JSON.stringify(snapshot.payload)).digest('hex')});
+test('actual browser state-ack is accepted silently for joined peers without changing authority or revisions',async t=>{
+ const f=await fixture(t),room=f.server.rooms.get(f.room),before={host:room.host,revision:room.revision,state:JSON.stringify(room.state),transport:JSON.stringify(room.transport)};
+ f.client.send({...acknowledgement(f.snapshot),room:f.room});f.client.send({type:'state-request',room:f.room});const returned=await f.client.next('state');
+ assert.deepEqual(returned.payload,f.snapshot.payload);assert.equal(f.client.messages.filter(m=>m.type==='error').length,0);assert.equal(room.host,before.host);assert.equal(room.revision,before.revision);assert.equal(JSON.stringify(room.state),before.state);assert.equal(JSON.stringify(room.transport),before.transport);
+});
+test('ACK shape is bounded and never accepts client authority data; joining and room scope still apply',async t=>{
+ const f=await fixture(t),room=f.server.rooms.get(f.room),before=JSON.stringify({revision:room.revision,state:room.state,transport:room.transport}),ack=acknowledgement(f.snapshot);
+ for(const bad of [{...ack,revision:-1},{...ack,revision:1.5},{...ack,revision:Number.MAX_SAFE_INTEGER},{...ack,revision:'1'},{...ack,checksum:'a'.repeat(63)},{...ack,checksum:'z'.repeat(64)},{...ack,checksum:'a'.repeat(2048)},{...ack,payload:state},{...ack,isHost:true}]){f.client.send({...bad,room:f.room});assert.equal((await f.client.next('error')).code,'invalid-state-ack');}
+ f.client.send({...ack,room:'other'});assert.equal((await f.client.next('error')).code,'room-mismatch');const stranger=await f.peer();stranger.send({...ack,room:f.room});assert.equal((await stranger.next('error')).code,'not-joined');assert.equal(JSON.stringify({revision:room.revision,state:room.state,transport:room.transport}),before);
+});
+test('browser state-recovery-request returns the canonical authoritative snapshot without mutation',async t=>{
+ const f=await fixture(t),room=f.server.rooms.get(f.room),before=JSON.stringify({revision:room.revision,state:room.state,transport:room.transport});
+ f.client.send({type:'state-recovery-request',room:f.room,reason:'invalid-state-payload',revision:f.snapshot.revision});const recovered=await f.client.next('state');f.client.send({type:'state-request',room:f.room});const canonical=await f.client.next('state');assert.deepEqual(recovered,canonical);assert.equal(recovered.authoritativeRefresh,true);assert.deepEqual(recovered.payload,state);assert.equal(f.client.messages.filter(m=>m.type==='error').length,0);assert.equal(JSON.stringify({revision:room.revision,state:room.state,transport:room.transport}),before);
+});
+test('malformed recovery cannot publish state or alter revision and transport',async t=>{
+ const f=await fixture(t),room=f.server.rooms.get(f.room),before=JSON.stringify({revision:room.revision,state:room.state,transport:room.transport});
+ const recovery={type:'state-recovery-request',room:f.room,reason:'invalid-state-payload',revision:f.snapshot.revision};
+ for(const bad of [{...recovery,revision:-1},{...recovery,reason:'x'.repeat(2000)},{...recovery,payload:{tempo:300}},{...recovery,hostCredential:'forged'}]){f.client.send(bad);assert.equal((await f.client.next('error')).code,'invalid-state-recovery-request');}
+ assert.equal(JSON.stringify({revision:room.revision,state:room.state,transport:room.transport}),before);
+});

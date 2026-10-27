@@ -1,0 +1,5 @@
+const test=require('node:test'),assert=require('node:assert/strict'),{validateState}=require('../server');
+const practice={version:1,enabled:true,mode:'ramp',startBpm:100,targetBpm:180,bpmStep:5,stepBars:2,onMaxAction:'hold',warmupBars:2,rampBars:8,targetBars:4,recoveryBars:2,audibleBars:2,silentBars:1};
+const state={tempo:120,volume:1,Tracks:[{volume:1,currentBar:0,currentBeat:0,barSettings:[{beats:4,subdivision:1,rests:[]}]}],selectedTrackIndex:0,selectedBarIndexInContainer:0,practice};
+test('device timing keys are rejected recursively at network boundaries',()=>{assert.equal(validateState({...state,outputOffsetMs:15}),false);assert.equal(validateState({...state,Tracks:state.Tracks.map(t=>({...t,mainBeatSound:{sound:'Synth Sine',settings:{audioLatencyOffset:15}}}))}),false);});
+test('practice shared schema rejects out-of-range and nested local state',()=>{assert.equal(validateState(state),true);for(const bad of [{...practice,startBpm:Infinity},{...practice,silentBars:129},{...practice,outputOffsetMs:27},{...practice,device:{name:'private'}}])assert.equal(validateState({...state,practice:bad}),false);});

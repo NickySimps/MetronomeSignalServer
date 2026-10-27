@@ -4,6 +4,11 @@ const crypto = require('crypto');
 
 const MAX_STATE_BYTES = 256 * 1024;
 const SECURE_ROOM_SUFFIX = /_([a-f0-9]{32})$/i;
+function requiresLogicalBeats(state) {
+  const tracks = [...(Array.isArray(state?.Tracks) ? state.Tracks : []), ...(Array.isArray(state?.song?.sections) ? state.song.sections : []).flatMap(s => Array.isArray(s?.tracks) ? s.tracks : [])];
+  return tracks.some(t => Array.isArray(t?.barSettings) && t.barSettings.some(b => b && Object.keys(b.beatSlices || {}).length > 0
+    && (b.rests?.length > 0 || Object.keys(b.velocities || {}).length > 0 || Object.keys(b.beatSounds || {}).length > 0)));
+}
 
 function generatePeerId() {
   return crypto.randomBytes(8).toString('hex');
@@ -17,23 +22,34 @@ function isBoundedInteger(value, min, max) {
   return Number.isInteger(value) && value >= min && value <= max;
 }
 
-function validateJsonShape(value, depth = 0) {
+function validateJsonShape(value, depth = 0, path = '') {
   if (depth > 12) return false;
+  // Only these exact musical bar paths may exceed the generic 64-key cap.
+  // Typed validators bound both the index domain and every leaf/container.
+  const slotPath = /^(Tracks\[\]|song\.sections\[\]\.tracks\[\])\.barSettings\[\]\.(velocities|beatSounds|beatSlices|beatSliceAnchors)$/.exec(path);
+  if (slotPath) return validateBarMaps({ [slotPath[2]]: value });
   if (value === null || typeof value === 'boolean') return true;
   if (typeof value === 'number') return Number.isFinite(value);
   if (typeof value === 'string') return value.length <= 512;
   if (Array.isArray(value)) {
-    return value.length <= 256 && value.every(item => validateJsonShape(item, depth + 1));
+    return value.length <= 256 && value.every(item => validateJsonShape(item, depth + 1, `${path}[]`));
   }
   if (typeof value !== 'object') return false;
   const keys = Object.keys(value);
   return keys.length <= 64
-    && keys.every(key => key.length <= 64 && validateJsonShape(value[key], depth + 1));
+    && keys.every(key => key.length <= 64 && !['outputOffsetMs','audioLatencyOffset','outputLatencyMs','baseLatencyMs','outputCorrectionMs'].includes(key) && validateJsonShape(value[key], depth + 1, path ? `${path}.${key}` : key));
 }
 
 function hasOnlyKeys(value, allowedKeys) {
   return Object.keys(value).every(key => allowedKeys.has(key));
 }
+
+const PUBLIC_NUMERIC_SOUND_SETTINGS = new Set([
+  'volume', 'startFrequency', 'endFrequency', 'attack', 'decay', 'sustain', 'release', 'pitchEnvelopeTime', 'pitchShift',
+  'bodyFrequencyStart', 'bodyFrequencyEnd', 'noiseFilterFrequency', 'filterFrequency', 'frequency', 'frequency1', 'frequency2', 'qValue', 'detune',
+  'trimStart', 'trimEnd', 'highPassFrequency', 'lowPassFrequency', 'distortion', 'delayMix', 'delayTime', 'delayFeedback', 'reverbMix', 'reverbFeedback', 'probability'
+]);
+const PUBLIC_BOOLEAN_SOUND_SETTINGS = new Set(['reverse', 'allowOverlap', 'retrigger', 'fxBypass']);
 
 function validateSnapshotSound(value) {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -41,21 +57,49 @@ function validateSnapshotSound(value) {
     && typeof value.sound === 'string' && value.sound.length >= 1 && value.sound.length <= 64
     && !/^Recording:/i.test(value.sound)
     && value.settings && typeof value.settings === 'object' && !Array.isArray(value.settings)
-    && validateJsonShape(value.settings);
+    && Object.entries(value.settings).every(([key, setting]) =>
+      (PUBLIC_NUMERIC_SOUND_SETTINGS.has(key) && isFiniteNumber(setting))
+      || (PUBLIC_BOOLEAN_SOUND_SETTINGS.has(key) && typeof setting === 'boolean')
+      || (key === 'type' && ['sine', 'square', 'sawtooth', 'triangle'].includes(setting)));
+}
+
+// Musical slot maps are typed containers, never generic metadata bags.
+function validateSlotMap(value, validateEntry) {
+  return value === undefined || (value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length <= 512
+    && Object.entries(value).every(([key, entry]) => /^(0|[1-9]\d{0,2})$/.test(key)
+      && Number(key) <= 511 && validateEntry(entry)));
+}
+
+function validateBeatOverrides(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && hasOnlyKeys(value, new Set(['mainBeatSound', 'subdivisionSound']))
+    && (value.mainBeatSound === undefined || validateSnapshotSound(value.mainBeatSound))
+    && (value.subdivisionSound === undefined || validateSnapshotSound(value.subdivisionSound));
+}
+
+function validateBarMaps(bar) {
+  return validateSlotMap(bar.velocities, value => isFiniteNumber(value) && value >= 0 && value <= 1)
+    && validateSlotMap(bar.beatSounds, validateBeatOverrides)
+    && validateSlotMap(bar.beatSlices, value => [2, 3, 4, 6, 8, 16, 32].includes(value))
+    && validateSlotMap(bar.beatSliceAnchors, value => isBoundedInteger(value, 0, 511));
 }
 
 function validateSnapshotTrack(track) {
   if (!track || typeof track !== 'object' || Array.isArray(track)
     || !hasOnlyKeys(track, new Set([
-      'name', 'barSettings', 'muted', 'solo', 'volume', 'mainBeatSound', 'subdivisionSound'
+      'name', 'barSettings', 'muted', 'solo', 'volume', 'pitchShift', 'swing', 'mainBeatSound', 'subdivisionSound'
     ]))
     || (track.name !== undefined && (typeof track.name !== 'string' || track.name.length < 1 || track.name.length > 64))
     || !Array.isArray(track.barSettings) || track.barSettings.length < 1 || track.barSettings.length > 64
     || typeof track.muted !== 'boolean' || typeof track.solo !== 'boolean'
     || !isFiniteNumber(track.volume) || track.volume < 0 || track.volume > 1
+    || (track.pitchShift !== undefined && !isBoundedInteger(track.pitchShift, -12, 12))
+    || (track.swing !== undefined && (!isFiniteNumber(track.swing) || track.swing < 0 || track.swing > 100))
     || !validateSnapshotSound(track.mainBeatSound) || !validateSnapshotSound(track.subdivisionSound)) return false;
   return track.barSettings.every(bar => bar && typeof bar === 'object' && !Array.isArray(bar)
-    && hasOnlyKeys(bar, new Set(['beats', 'subdivision', 'rests']))
+    && hasOnlyKeys(bar, new Set(['beats', 'subdivision', 'rests', 'velocities', 'beatSounds', 'beatSlices', 'beatSliceAnchors']))
+    && validateBarMaps(bar)
     && isBoundedInteger(bar.beats, 1, 64)
     && isFiniteNumber(bar.subdivision) && bar.subdivision >= 0.125 && bar.subdivision <= 16
     && Array.isArray(bar.rests) && bar.rests.length <= 256
@@ -73,8 +117,18 @@ function parseCapabilities(value) {
   return capabilities;
 }
 
+function validatePractice(value) {
+  const keys=['version','enabled','mode','startBpm','targetBpm','bpmStep','stepBars','onMaxAction','warmupBars','rampBars','targetBars','recoveryBars','audibleBars','silentBars'];
+  return value && typeof value==='object' && !Array.isArray(value) && Object.keys(value).length===keys.length && Object.keys(value).every(k=>keys.includes(k))
+    && value.version===1 && typeof value.enabled==='boolean' && ['step','ramp'].includes(value.mode) && ['hold','stop','reset'].includes(value.onMaxAction)
+    && ['startBpm','targetBpm'].every(k=>isFiniteNumber(value[k])&&value[k]>=20&&value[k]<=300)
+    && isBoundedInteger(value.bpmStep,1,100)
+    && ['stepBars','rampBars','targetBars','recoveryBars','audibleBars'].every(k=>isBoundedInteger(value[k],1,128))
+    && ['warmupBars','silentBars'].every(k=>isBoundedInteger(value[k],0,128));
+}
 function validateState(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+  if (payload.practice !== undefined && !validatePractice(payload.practice)) return false;
   if (!isBoundedInteger(payload.tempo, 20, 400)) return false;
   if (!isFiniteNumber(payload.volume) || payload.volume < 0 || payload.volume > 1) return false;
   if (payload.countInBars !== undefined && !isBoundedInteger(payload.countInBars, 0, 8)) return false;
@@ -121,8 +175,16 @@ function validateState(payload) {
     }
 
     const currentBar = track.barSettings[track.currentBar];
-    const maxBeat = Math.ceil(currentBar.beats * currentBar.subdivision) - 1;
-    if (!isBoundedInteger(track.currentBeat, 0, Math.max(0, maxBeat))) return false;
+    // currentBeat indexes expanded playback slots, not unsliced base beats.
+    // Match beatTiming.getBeatSlots without allocating its bounded slot array.
+    const baseSlots = currentBar.subdivision < 1
+      ? Math.max(1, Math.floor(currentBar.beats * currentBar.subdivision))
+      : Math.round(currentBar.beats * currentBar.subdivision);
+    let slotCount = baseSlots;
+    for (const [index, count] of Object.entries(currentBar.beatSlices || {})) {
+      if (Number(index) < baseSlots) slotCount += count - 1;
+    }
+    if (!isBoundedInteger(track.currentBeat, 0, slotCount - 1)) return false;
   }
 
   if (payload.song && payload.song.sections.some(section => section.startBar >= payload.Tracks[0].barSettings.length)) return false;
@@ -290,6 +352,11 @@ function createSyncServer({
   };
 
   const sanitizeState = payload => {
+    // v192 included this device-only key. Discard it at the legacy envelope
+    // seam; reject it at every nested schema boundary and never rebroadcast it.
+    if(payload && typeof payload==='object' && !Array.isArray(payload)) {
+      const {audioLatencyOffset:_legacyTiming,...shared}=payload;payload=shared;
+    }
     if (!validateState(payload)) return null;
     if (Buffer.byteLength(JSON.stringify(payload), 'utf8') > MAX_STATE_BYTES) return null;
     const state = { ...payload };
@@ -315,7 +382,12 @@ function createSyncServer({
     return false;
   };
 
+  const cancelSongChange = room => {
+    clearTimeout(room.songChangeTimer);room.songChangeTimer=null;
+    if(room.pendingSongChange){const commandId=room.pendingSongChange.commandId;room.pendingSongChange=null;room.revision++;broadcast(room,{type:'song-change',room:room.id,revision:room.revision,cancelled:true,...(commandId ? {commandId} : {})});}
+  };
   const closeRoom = (room, reason = 'host-disconnected') => {
+    cancelSongChange(room);
     clearTimeout(room.recoveryTimer);
     retireRoom(room);
     broadcast(room, { type: 'room-closed', room: room.id, reason }, room.host);
@@ -434,6 +506,12 @@ function createSyncServer({
           return;
         }
         const roomSongCapability = requiredSongCapability(room?.state?.payload);
+        if ((requiresLogicalBeats(room?.state?.payload) || requiresLogicalBeats({song:room?.pendingSongChange?.song})) && !capabilities.has('logical-beats-v1')) {
+          send(ws,{type:'error',code:'incompatible-client',message:'This room requires logical-beats-v1 for sliced beat overrides.'});return;
+        }
+        if ((room?.state?.payload?.practice?.enabled && !capabilities.has('practice-v1')) || (room?.pendingSongChange && !capabilities.has('song-boundary-v1'))) {
+          send(ws,{type:'error',code:'incompatible-client',message:'Advanced practice/queued transport support is required.'});return;
+        }
         if (roomSongCapability && !capabilities.has(roomSongCapability)) {
           send(ws, { type: 'error', code: 'incompatible-client', message: 'This room requires song mode support.' });
           return;
@@ -483,6 +561,7 @@ function createSyncServer({
             room.clients.delete(previousHost);
             previousHost.roomId = null;
             previousHost.isHost = false;
+            cancelSongChange(room);
             room.host = ws;
             replacedHost = true;
             if (room.recoverable) {
@@ -533,12 +612,13 @@ function createSyncServer({
         send(ws, {
           type: 'joined', room: roomId, peerId: ws.peerId,
           isHost: ws.isHost, clientCount: clientCount(room), createdRoom, replacedHost,
-          capabilities: ['rehearsal-v1'],
+          capabilities: ['rehearsal-v1','practice-v1','song-boundary-v1','logical-beats-v1'],
           ...(participantCredential ? { participantCredential } : {})
         });
         if ((!ws.isHost || replacedHost) && room.state) {
           send(ws, { type: 'state', room: roomId, revision: room.state.revision, payload: room.state.payload });
         }
+        if(room.pendingSongChange)send(ws,{type:'song-change',room:roomId,...room.pendingSongChange});
         if (!ws.isHost || replacedHost) {
           send(ws, { type: 'transport', room: roomId, ...room.transport });
         }
@@ -609,6 +689,7 @@ function createSyncServer({
           }
           const hostCredential = crypto.randomBytes(32).toString('hex');
           room.credentialDigest = credentialDigest(hostCredential);
+          cancelSongChange(room);
           room.host = target;
           room.recoverable = true;
           ws.isHost = false;
@@ -658,6 +739,22 @@ function createSyncServer({
           });
           break;
         }
+        case 'state-ack':
+          // Receipt diagnostics only: never accept an ACK as state or authority.
+          // The existing per-socket message/byte limits still apply.
+          if (raw.length > 1024 || !hasOnlyKeys(data,new Set(['type','room','revision','checksum']))
+            || !Number.isSafeInteger(data.revision) || data.revision < 0 || data.revision > room.revision
+            || typeof data.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(data.checksum)) {
+            send(ws,{type:'error',code:'invalid-state-ack',message:'State acknowledgement failed validation.'});
+          }
+          break;
+        case 'state-recovery-request':
+          if (raw.length > 1024 || !hasOnlyKeys(data,new Set(['type','room','revision','reason']))
+            || !Number.isSafeInteger(data.revision) || data.revision < 0 || data.reason !== 'invalid-state-payload') {
+            send(ws,{type:'error',code:'invalid-state-recovery-request',message:'State recovery request failed validation.'});
+            break;
+          }
+          // Same canonical, read-only recovery path as a legacy state request.
         case 'state-request':
           if (room.state) {
             send(ws, {
@@ -679,9 +776,10 @@ function createSyncServer({
             return;
           }
           const songCapability = requiredSongCapability(payload);
-          if (songCapability
-            && [...room.clients].some(client => !client.capabilities?.has(songCapability))) {
-            send(ws, { type: 'error', code: 'incompatible-client', message: 'Every room member must support song mode.' });
+          if ((songCapability && [...room.clients].some(client => !client.capabilities?.has(songCapability)))
+            || (requiresLogicalBeats(payload) && [...room.clients].some(client=>!client.capabilities?.has('logical-beats-v1')))
+            || (payload.practice?.enabled && [...room.clients].some(client=>!client.capabilities?.has('practice-v1')))) {
+            send(ws, { type: 'error', code: 'incompatible-client', message: 'Every room member must support the required song/practice/logical-beats-v1 semantics.' });
             if (room.state) {
               send(ws, {
                 type: 'state', room: room.id, revision: room.state.revision,
@@ -691,9 +789,57 @@ function createSyncServer({
             return;
           }
           room.revision += 1;
+          // Runtime position/presence refreshes do not invalidate a staged edit.
+          const musicalIdentity = state => JSON.stringify(state && {
+            tempo:state.tempo,volume:state.volume,countInBars:state.countInBars,
+            practice:state.practice,song:state.song,customSounds:state.customSounds,
+            Tracks:state.Tracks.map(({currentBar,currentBeat,nextBeatTime,songRepeatIteration,...music})=>music)
+          });
+          const previous = room.state?.payload;
+          const sameMusic = musicalIdentity(previous) === musicalIdentity(payload);
+          // Applying the active section resolves its already-declared tempo into
+          // the host's root tempo. It is playback progress, not a new musical edit.
+          // Non-derived tempo edits and every other musical change still cancel.
+          const derivedSectionTempo = room.transport.playing && payload.song?.enabled
+            && payload.tempo === tempoForBar(payload, payload.Tracks[0].currentBar)
+            && previous && musicalIdentity({...previous, tempo:payload.tempo}) === musicalIdentity(payload);
+          if (!sameMusic && !derivedSectionTempo) cancelSongChange(room);
           room.state = { revision: room.revision, payload };
           broadcast(room, { type: 'state', room: room.id, revision: room.revision, payload }, ws);
           break;
+        }
+        case 'song-change-command': {
+          if(!requireHost(ws,room))return;
+          if([...room.clients].some(c=>!c.capabilities?.has('song-boundary-v1'))){send(ws,{type:'error',code:'incompatible-client',message:'Every peer must support queued musical boundaries.'});return;}
+          const c=data.change;
+          if(c===null){cancelSongChange(room);break;}
+          const p=room.state?.payload;
+          if (requiresLogicalBeats({song:c?.song}) && [...room.clients].some(client=>!client.capabilities?.has('logical-beats-v1'))) {
+            send(ws,{type:'error',code:'incompatible-client',message:'Every peer must support logical-beats-v1 for this queued song.'});
+            if(room.state)send(ws,{type:'state',room:room.id,revision:room.state.revision,payload:room.state.payload,authoritativeRefresh:true});
+            return;
+          }
+          if(!room.transport.playing || !p || !c || typeof c!=='object' || Array.isArray(c) || !hasOnlyKeys(c,new Set(['version','song','sectionIndex','startBar','effectiveAt','commandId'])) || c.version!==1
+            || (c.commandId !== undefined && (typeof c.commandId !== 'string' || !/^[a-f0-9]{32}$/.test(c.commandId)))
+            || !isFiniteNumber(c.effectiveAt) || c.effectiveAt<Date.now()+200 || c.effectiveAt>Date.now()+600000
+            || !isBoundedInteger(c.startBar,0,p.Tracks[0].barSettings.length-1)
+            || (c.sectionIndex!==null && !isBoundedInteger(c.sectionIndex,0,(c.song?.sections?.length||0)-1))
+            || (c.sectionIndex!==null && c.song?.sections?.[c.sectionIndex]?.startBar!==c.startBar)
+            || !validateState({...p,song:c.song}) || c.song?.version!==2
+            || Buffer.byteLength(JSON.stringify({...p,song:c.song}), 'utf8') > MAX_STATE_BYTES
+            || [...room.clients].some(client=>!client.capabilities?.has('song-v2'))){send(ws,{type:'error',code:'invalid-song-change',message:'Invalid or incompatible queued song.'});return;}
+          cancelSongChange(room);room.revision++;
+          const command={...c,revision:room.revision};room.pendingSongChange=command;
+          broadcast(room,{type:'song-change',room:room.id,...command});
+          const host=room.host;
+          room.songChangeTimer=setTimeout(()=>{
+            if(room.pendingSongChange!==command || rooms.get(room.id)!==room || room.host!==host || !room.transport.playing)return;
+            room.pendingSongChange=null;room.songChangeTimer=null;
+            const revision=++room.revision;
+            room.state={revision,payload:{...room.state.payload,song:command.song}};
+            room.transport={...room.transport,effectiveAt:command.effectiveAt,currentBar:command.startBar,currentBeat:0,repeatIteration:0,revision};
+          },Math.max(0,command.effectiveAt-Date.now()));
+          room.songChangeTimer.unref?.();break;
         }
         case 'transport-command': {
           if (!requireHost(ws, room)) return;
@@ -704,12 +850,14 @@ function createSyncServer({
             return;
           }
           room.revision += 1;
+          cancelSongChange(room);
           const transportLead = transportLeadForRoom(room);
           const startsAt = Date.now() + transportLead;
           const countIn = data.playing ? countInForTransport(room, data.currentBar, startsAt) : null;
           room.transport = {
             playing: data.playing,
             effectiveAt: startsAt + (countIn ? countIn.totalBeats * countIn.beatIntervalMs : 0),
+            practiceEpochAt: startsAt + (countIn ? countIn.totalBeats * countIn.beatIntervalMs : 0),
             currentBar: data.currentBar,
             currentBeat: data.currentBeat,
             repeatIteration: 0,
@@ -739,6 +887,7 @@ function createSyncServer({
           room.transport = {
             playing: true,
             effectiveAt: pulseTime,
+            practiceEpochAt: room.transport.practiceEpochAt,
             currentBar: data.currentBar,
             currentBeat: data.currentBeat,
             repeatIteration: data.repeatIteration || 0,
@@ -772,6 +921,7 @@ function createSyncServer({
       if (!room) return;
       room.clients.delete(ws);
       room.controlRequests.delete(ws.peerId);
+      if(room.host===ws)cancelSongChange(room);
       if (room.host === ws && room.recoverable) {
         room.revision += 1;
         if (room.state) room.state = { revision: room.revision, payload: { ...room.state.payload, isPlaying: false } };
