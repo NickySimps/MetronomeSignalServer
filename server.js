@@ -4,6 +4,11 @@ const crypto = require('crypto');
 
 const MAX_STATE_BYTES = 256 * 1024;
 const SECURE_ROOM_SUFFIX = /_([a-f0-9]{32})$/i;
+function requiresMelody(state) {
+  // Presence is semantic, even for empty notes or disabled song sections.
+  const tracks = [...(Array.isArray(state?.Tracks) ? state.Tracks : []), ...(Array.isArray(state?.song?.sections) ? state.song.sections : []).flatMap(s => Array.isArray(s?.tracks) ? s.tracks : [])];
+  return tracks.some(track => track && Object.prototype.hasOwnProperty.call(track, 'melody'));
+}
 function requiresLogicalBeats(state) {
   const tracks = [...(Array.isArray(state?.Tracks) ? state.Tracks : []), ...(Array.isArray(state?.song?.sections) ? state.song.sections : []).flatMap(s => Array.isArray(s?.tracks) ? s.tracks : [])];
   return tracks.some(t => Array.isArray(t?.barSettings) && t.barSettings.some(b => b && Object.keys(b.beatSlices || {}).length > 0
@@ -85,19 +90,56 @@ function validateBarMaps(bar) {
     && validateSlotMap(bar.beatSliceAnchors, value => isBoundedInteger(value, 0, 511));
 }
 
-function validateSnapshotTrack(track) {
+// Melody is a public musical score only; never accept sample/capture metadata.
+// IDs are track-scoped stable ASCII tokens, including across different bars.
+function validateMelody(track) {
+  if (!Object.prototype.hasOwnProperty.call(track, 'melody')) return true;
+  const melody = track.melody;
+  if (!melody || typeof melody !== 'object' || Array.isArray(melody)
+    || !hasOnlyKeys(melody, new Set(['version', 'bars', 'sampleRootMidi']))
+    || melody.version !== 1 || !Array.isArray(melody.bars)
+    || melody.bars.length !== track.barSettings.length
+    || (Object.prototype.hasOwnProperty.call(melody, 'sampleRootMidi')
+      && (Object.is(melody.sampleRootMidi, -0) || !isBoundedInteger(melody.sampleRootMidi, 0, 127)))) return false;
+  const ids = new Set();
+  let total = 0;
+  return melody.bars.every((notes, index) => {
+    const beats = track.barSettings[index]?.beats;
+    // Keep this public contract aligned with the frontend melody schema even
+    // when the rhythm-only transport supports larger meters.
+    if (!isBoundedInteger(beats, 1, 32)) return false;
+    const barTicks = beats * 960;
+    if (!Array.isArray(notes) || notes.length > 128 || (total += notes.length) > 2048) return false;
+    return notes.every(note => {
+      if (!note || typeof note !== 'object' || Array.isArray(note)
+        || !hasOnlyKeys(note, new Set(['id', 'midi', 'startTick', 'durationTicks', 'velocity']))
+        || typeof note.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(note.id) || ids.has(note.id)
+        || Object.is(note.midi, -0) || !isBoundedInteger(note.midi, 0, 127)
+        || Object.is(note.startTick, -0) || !isBoundedInteger(note.startTick, 0, barTicks - 1)
+        || !isBoundedInteger(note.durationTicks, 1, barTicks - note.startTick)
+        || !isFiniteNumber(note.velocity) || Object.is(note.velocity, -0) || note.velocity < 0 || note.velocity > 1) return false;
+      ids.add(note.id);
+      return true;
+    });
+  });
+}
+
+function validateSnapshotTrack(track, runtime = false) {
   if (!track || typeof track !== 'object' || Array.isArray(track)
     || !hasOnlyKeys(track, new Set([
-      'name', 'barSettings', 'muted', 'solo', 'volume', 'pitchShift', 'swing', 'mainBeatSound', 'subdivisionSound'
+      'name', 'barSettings', 'muted', 'solo', 'volume', 'pitchShift', 'swing', 'mainBeatSound', 'subdivisionSound', 'melody',
+      ...(runtime ? ['currentBar', 'currentBeat', 'nextBeatTime', 'songRepeatIteration'] : [])
     ]))
     || (track.name !== undefined && (typeof track.name !== 'string' || track.name.length < 1 || track.name.length > 64))
     || !Array.isArray(track.barSettings) || track.barSettings.length < 1 || track.barSettings.length > 64
     || typeof track.muted !== 'boolean' || typeof track.solo !== 'boolean'
     || !isFiniteNumber(track.volume) || track.volume < 0 || track.volume > 1
+    || (runtime && track.nextBeatTime !== undefined && (!isFiniteNumber(track.nextBeatTime) || track.nextBeatTime < 0))
+    || (runtime && track.songRepeatIteration !== undefined && !isBoundedInteger(track.songRepeatIteration, 0, 15))
     || (track.pitchShift !== undefined && !isBoundedInteger(track.pitchShift, -12, 12))
     || (track.swing !== undefined && (!isFiniteNumber(track.swing) || track.swing < 0 || track.swing > 100))
     || !validateSnapshotSound(track.mainBeatSound) || !validateSnapshotSound(track.subdivisionSound)) return false;
-  return track.barSettings.every(bar => bar && typeof bar === 'object' && !Array.isArray(bar)
+  return validateMelody(track) && track.barSettings.every(bar => bar && typeof bar === 'object' && !Array.isArray(bar)
     && hasOnlyKeys(bar, new Set(['beats', 'subdivision', 'rests', 'velocities', 'beatSounds', 'beatSlices', 'beatSliceAnchors']))
     && validateBarMaps(bar)
     && isBoundedInteger(bar.beats, 1, 64)
@@ -126,7 +168,7 @@ function validatePractice(value) {
     && ['stepBars','rampBars','targetBars','recoveryBars','audibleBars'].every(k=>isBoundedInteger(value[k],1,128))
     && ['warmupBars','silentBars'].every(k=>isBoundedInteger(value[k],0,128));
 }
-function validateState(payload) {
+function validateState(payload, melodyRequired = false) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
   if (payload.practice !== undefined && !validatePractice(payload.practice)) return false;
   if (!isBoundedInteger(payload.tempo, 20, 400)) return false;
@@ -134,6 +176,8 @@ function validateState(payload) {
   if (payload.countInBars !== undefined && !isBoundedInteger(payload.countInBars, 0, 8)) return false;
   if (!Array.isArray(payload.Tracks) || payload.Tracks.length < 1 || payload.Tracks.length > 32) return false;
   if (!validateJsonShape(payload)) return false;
+  const melodyState = melodyRequired || requiresMelody(payload);
+  if (melodyState && !validateMelodyEnvelope(payload)) return false;
 
   if (payload.song !== undefined) {
     const song = payload.song;
@@ -156,15 +200,17 @@ function validateState(payload) {
         || !isBoundedInteger(section.repeats, 1, 16)
         || (section.tracks !== undefined
           && (!Array.isArray(section.tracks) || section.tracks.length < 1 || section.tracks.length > 16
-            || !section.tracks.every(validateSnapshotTrack)))) return false;
+            || !section.tracks.every(track => validateSnapshotTrack(track))))) return false;
       previousStartBar = section.startBar;
     }
     if (song.sections[0].startBar !== 0) return false;
   }
 
   for (const track of payload.Tracks) {
+    if (melodyState && !validateSnapshotTrack(track, true)) return false;
     if (!track || typeof track !== 'object' || !Array.isArray(track.barSettings)) return false;
     if (track.barSettings.length < 1 || track.barSettings.length > 64) return false;
+    if (!validateMelody(track)) return false;
     if (!isFiniteNumber(track.volume) || track.volume < 0 || track.volume > 1) return false;
     if (!isBoundedInteger(track.currentBar, 0, track.barSettings.length - 1)) return false;
 
@@ -192,7 +238,58 @@ function validateState(payload) {
   const selectedTrack = payload.selectedTrackIndex >= 0 ? payload.Tracks[payload.selectedTrackIndex] : null;
   if (!Number.isInteger(payload.selectedBarIndexInContainer) || payload.selectedBarIndexInContainer < -1) return false;
   if (selectedTrack && payload.selectedBarIndexInContainer >= selectedTrack.barSettings.length) return false;
-  return true;
+  return !melodyState || validatePublicAssets(payload);
+}
+
+// New melody publication is fail-closed. Legacy rhythm envelopes retain their
+// historical compatibility, but cannot be promoted into a melody snapshot
+// (including a queued song) with opaque metadata or unverified local assets.
+function validateMelodyEnvelope(payload) {
+  const flags = ['controlsAttachedToTrack', 'isPlaying', 'isRestMode', 'isAccentMode', 'isSliceMode', 'isRecording'];
+  return hasOnlyKeys(payload, new Set([
+    'tempo', 'volume', 'countInBars', 'practice', 'song', 'Tracks',
+    'selectedTrackIndex', 'selectedBarIndexInContainer', 'customSounds', ...flags
+  ])) && flags.every(key => payload[key] === undefined || typeof payload[key] === 'boolean');
+}
+
+// These are the deployed client's public synthesis/sample catalog, not name
+// heuristics. Unknown sources cannot be distinguished from device recordings.
+const PUBLIC_SOUND_SOURCES = new Set([
+  'Synth Kick', 'Synth Snare', 'Synth HiHat', 'Synth Open HiHat', 'Synth Hi Tom', 'Synth Mid Tom', 'Synth Low Tom',
+  'Synth Clap', 'Synth Claves', 'Synth Shaker', 'Synth Cymbal', 'Synth Cowbell', 'Synth Woodblock', 'Synth Triangle',
+  'Synth Maraca', 'Synth Sine', 'Synth Square', 'Synth Sawtooth', 'Synth Ultrasaw', 'Synth Noise',
+  'Click1.mp3', 'Click2.mp3', 'Crank1.mp3', 'Crank2.mp3'
+]);
+function validatePublicAssets(payload) {
+  const custom = payload.customSounds === undefined ? {} : payload.customSounds;
+  if (!custom || typeof custom !== 'object' || Array.isArray(custom) || Object.keys(custom).length > 64) return false;
+  for (const [name, value] of Object.entries(custom)) {
+    if (!name.length || name.length > 64 || !value || typeof value !== 'object' || Array.isArray(value)
+      || !hasOnlyKeys(value, new Set(['baseSound', 'settings']))
+      || typeof value.baseSound !== 'string' || !value.baseSound.length || value.baseSound.length > 64
+      || !validateSnapshotSound({ sound: 'Synth Kick', settings: value.settings })) return false;
+  }
+  const verified = new Set();
+  function publicSource(name, seen = new Set()) {
+    if (verified.has(name)) return true;
+    if (seen.has(name) || seen.size >= 64) return false;
+    if (!Object.prototype.hasOwnProperty.call(custom, name)) return PUBLIC_SOUND_SOURCES.has(name);
+    seen.add(name);
+    if (!publicSource(custom[name].baseSound, seen)) return false;
+    verified.add(name);
+    return true;
+  }
+  // Validate even unused aliases: they too are transmitted to every recipient.
+  if (!Object.keys(custom).every(name => publicSource(name))) return false;
+  const tracks = [...payload.Tracks, ...(payload.song?.sections || []).flatMap(s => s.tracks || [])];
+  return tracks.every(track => {
+    const sounds = [track.mainBeatSound, track.subdivisionSound];
+    for (const bar of track.barSettings) for (const override of Object.values(bar.beatSounds || {})) {
+      if (override.mainBeatSound) sounds.push(override.mainBeatSound);
+      if (override.subdivisionSound) sounds.push(override.subdivisionSound);
+    }
+    return sounds.every(value => publicSource(value.sound));
+  });
 }
 
 function requiredSongCapability(payload) {
@@ -351,13 +448,13 @@ function createSyncServer({
     broadcastRehearsal(room);
   };
 
-  const sanitizeState = payload => {
+  const sanitizeState = (payload, melodyRequired = false) => {
     // v192 included this device-only key. Discard it at the legacy envelope
     // seam; reject it at every nested schema boundary and never rebroadcast it.
-    if(payload && typeof payload==='object' && !Array.isArray(payload)) {
+    if(payload && typeof payload==='object' && !Array.isArray(payload) && !melodyRequired && !requiresMelody(payload)) {
       const {audioLatencyOffset:_legacyTiming,...shared}=payload;payload=shared;
     }
-    if (!validateState(payload)) return null;
+    if (!validateState(payload, melodyRequired)) return null;
     if (Buffer.byteLength(JSON.stringify(payload), 'utf8') > MAX_STATE_BYTES) return null;
     const state = { ...payload };
     delete state.selectedTheme;
@@ -506,6 +603,10 @@ function createSyncServer({
           return;
         }
         const roomSongCapability = requiredSongCapability(room?.state?.payload);
+        if ((requiresMelody(room?.state?.payload) || requiresMelody({ song: room?.pendingSongChange?.song })) && !capabilities.has('melody-v1')) {
+          send(ws, { type: 'error', code: 'incompatible-client', message: 'This room requires melody-v1.' });
+          return;
+        }
         if ((requiresLogicalBeats(room?.state?.payload) || requiresLogicalBeats({song:room?.pendingSongChange?.song})) && !capabilities.has('logical-beats-v1')) {
           send(ws,{type:'error',code:'incompatible-client',message:'This room requires logical-beats-v1 for sliced beat overrides.'});return;
         }
@@ -612,7 +713,7 @@ function createSyncServer({
         send(ws, {
           type: 'joined', room: roomId, peerId: ws.peerId,
           isHost: ws.isHost, clientCount: clientCount(room), createdRoom, replacedHost,
-          capabilities: ['rehearsal-v1','practice-v1','song-boundary-v1','logical-beats-v1'],
+          capabilities: ['rehearsal-v1','practice-v1','song-boundary-v1','logical-beats-v1','melody-v1'],
           ...(participantCredential ? { participantCredential } : {})
         });
         if ((!ws.isHost || replacedHost) && room.state) {
@@ -770,16 +871,22 @@ function createSyncServer({
             send(ws, { type: 'error', code: 'state-rate-limit', message: 'State updates are arriving too quickly.' });
             return;
           }
-          const payload = sanitizeState(data.payload);
-          if (!payload) {
+          // A pending melody makes every refresh a strict public envelope,
+          // even when the refreshed root has no notes. Validate both snapshots
+          // before revision, queue, canonical state or outbound wire can change.
+          const pending = room.pendingSongChange;
+          const melodyRequired = requiresMelody(data.payload) || requiresMelody({ song: pending?.song });
+          const payload = sanitizeState(data.payload, melodyRequired);
+          if (!payload || (pending && !sanitizeState({ ...payload, song: pending.song }, melodyRequired))) {
             send(ws, { type: 'error', code: 'invalid-state', message: 'State payload failed validation.' });
             return;
           }
           const songCapability = requiredSongCapability(payload);
           if ((songCapability && [...room.clients].some(client => !client.capabilities?.has(songCapability)))
+            || (requiresMelody(payload) && [...room.clients].some(client => !client.capabilities?.has('melody-v1')))
             || (requiresLogicalBeats(payload) && [...room.clients].some(client=>!client.capabilities?.has('logical-beats-v1')))
             || (payload.practice?.enabled && [...room.clients].some(client=>!client.capabilities?.has('practice-v1')))) {
-            send(ws, { type: 'error', code: 'incompatible-client', message: 'Every room member must support the required song/practice/logical-beats-v1 semantics.' });
+            send(ws, { type: 'error', code: 'incompatible-client', message: 'Every room member must support the required song/practice/logical-beats-v1/melody-v1 semantics.' });
             if (room.state) {
               send(ws, {
                 type: 'state', room: room.id, revision: room.state.revision,
@@ -814,6 +921,11 @@ function createSyncServer({
           const c=data.change;
           if(c===null){cancelSongChange(room);break;}
           const p=room.state?.payload;
+          if (requiresMelody({ song: c?.song }) && [...room.clients].some(client => !client.capabilities?.has('melody-v1'))) {
+            send(ws, { type: 'error', code: 'incompatible-client', message: 'Every peer must support melody-v1 for this queued song.' });
+            if (room.state) send(ws, { type: 'state', room: room.id, revision: room.state.revision, payload: room.state.payload, authoritativeRefresh: true });
+            return;
+          }
           if (requiresLogicalBeats({song:c?.song}) && [...room.clients].some(client=>!client.capabilities?.has('logical-beats-v1'))) {
             send(ws,{type:'error',code:'incompatible-client',message:'Every peer must support logical-beats-v1 for this queued song.'});
             if(room.state)send(ws,{type:'state',room:room.id,revision:room.state.revision,payload:room.state.payload,authoritativeRefresh:true});
@@ -834,9 +946,17 @@ function createSyncServer({
           const host=room.host;
           room.songChangeTimer=setTimeout(()=>{
             if(room.pendingSongChange!==command || rooms.get(room.id)!==room || room.host!==host || !room.transport.playing)return;
+            // Admission and refresh checks are not a substitute for validating
+            // the exact snapshot promoted at the boundary. Fail closed and
+            // announce cancellation without echoing rejected data to logs/wire.
+            const payload = { ...room.state?.payload, song: command.song };
+            if (!validateState(payload) || Buffer.byteLength(JSON.stringify(payload), 'utf8') > MAX_STATE_BYTES) {
+              cancelSongChange(room);
+              return;
+            }
             room.pendingSongChange=null;room.songChangeTimer=null;
             const revision=++room.revision;
-            room.state={revision,payload:{...room.state.payload,song:command.song}};
+            room.state={revision,payload};
             room.transport={...room.transport,effectiveAt:command.effectiveAt,currentBar:command.startBar,currentBeat:0,repeatIteration:0,revision};
           },Math.max(0,command.effectiveAt-Date.now()));
           room.songChangeTimer.unref?.();break;
